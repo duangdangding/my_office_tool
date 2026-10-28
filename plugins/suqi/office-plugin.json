@@ -12,7 +12,9 @@
     "mode": "auto",
     "executable": [
       "src-tauri/target/release/suqi.exe",
-      "src-tauri/target/debug/suqi.exe"
+      "src-tauri/target/debug/suqi.exe",
+      "src-tauri/target/release/suqi",
+      "src-tauri/target/debug/suqi"
     ],
     "dev": {
       "program": "bun",

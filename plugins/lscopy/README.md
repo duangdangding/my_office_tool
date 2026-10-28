@@ -127,7 +127,7 @@ vite.config.ts      多页面构建配置（index + settings + blocked + transfe
 
 ```bash
 bun install            # 安装依赖
-bun run dev            # 仅起 Vite 前端（http://localhost:1420）
+bun run dev            # 仅起 Vite 前端（http://localhost:1441）
 bun run build          # tsc 类型检查 + Vite 构建（提交前必跑）
 bun run tauri dev      # 启动完整桌面应用（前端 + Rust 后端）
 bun run tauri build    # 打包发布产物

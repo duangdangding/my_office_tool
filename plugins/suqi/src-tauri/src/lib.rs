@@ -2507,6 +2507,7 @@ pub fn run() {
                     }
                 });
             }
+            office_plugin::ready();
             Ok(())
         })
         .run(tauri::generate_context!())

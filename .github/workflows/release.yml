@@ -10,7 +10,28 @@ permissions:
 
 jobs:
   release:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            id: win
+            target: ""
+            arch: x64
+            bundle: src-tauri/target/release/bundle
+          # Apple Silicon 原生构建。
+          - os: macos-latest
+            id: mac-arm64
+            target: ""
+            arch: arm64
+            bundle: src-tauri/target/release/bundle
+          # GitHub 使用 Apple Silicon runner 交叉构建 Intel 版本。
+          - os: macos-latest
+            id: mac-x86_64
+            target: x86_64-apple-darwin
+            arch: x86_64
+            bundle: src-tauri/target/x86_64-apple-darwin/release/bundle
+    runs-on: ${{ matrix.os }}
     env:
       # secrets 不能直接用于 if，先映射到 job 级环境变量。
       WINDOWS_CERT_PFX: ${{ secrets.WINDOWS_CERT_PFX }}
@@ -28,6 +49,10 @@ jobs:
         with:
           workspaces: src-tauri
 
+      - name: Add Rust target
+        if: matrix.target != ''
+        run: rustup target add ${{ matrix.target }}
+
       - name: Install frontend dependencies
         run: npm ci
 
@@ -40,9 +65,9 @@ jobs:
           cargo test --manifest-path src-tauri/Cargo.toml
           cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
 
-      # 配置 WINDOWS_CERT_PFX / WINDOWS_CERT_PASSWORD 后自动签名。
+      # Windows 代码签名：配置证书 secrets 后自动启用。
       - name: Prepare Windows code signing
-        if: env.WINDOWS_CERT_PFX != ''
+        if: matrix.id == 'win' && env.WINDOWS_CERT_PFX != ''
         shell: pwsh
         env:
           WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
@@ -66,10 +91,11 @@ jobs:
           $json | ConvertTo-Json -Depth 20 | Set-Content $confPath -Encoding utf8
 
       - name: Build release
-        run: npm run tauri build
+        run: npm run tauri build ${{ matrix.target != '' && format('-- --target {0}', matrix.target) || '' }}
 
-      # GitHub Release 资产统一使用 ASCII 文件名，避免中文被上传工具移除。
-      - name: Prepare release assets
+      # Release 资产统一使用 ASCII 文件名，避免中文被上传工具移除。
+      - name: Prepare Windows release assets
+        if: matrix.id == 'win'
         shell: pwsh
         run: |
           $ver = "${{ github.ref_name }}" -replace '^v',''
@@ -78,7 +104,24 @@ jobs:
           }
           Copy-Item 'src-tauri/target/release/office-toolbox.exe' "src-tauri/target/release/office-toolbox_${ver}_x64_portable.exe"
 
-      - name: Generate checksums
+      - name: Prepare macOS release assets
+        if: startsWith(matrix.id, 'mac')
+        shell: bash
+        run: |
+          set -e
+          ver="${GITHUB_REF_NAME#v}"
+          bundle="${{ matrix.bundle }}"
+          arch="${{ matrix.arch }}"
+          found=0
+          for file in "$bundle"/dmg/*.dmg; do
+            [ -e "$file" ] || continue
+            mv "$file" "$bundle/dmg/office-toolbox_${ver}_${arch}.dmg"
+            found=1
+          done
+          [ "$found" -eq 1 ] || { echo '未找到 macOS DMG 产物'; exit 1; }
+
+      - name: Generate Windows checksums
+        if: matrix.id == 'win'
         shell: pwsh
         run: |
           $files = @()
@@ -86,13 +129,27 @@ jobs:
           $files += Get-ChildItem 'src-tauri/target/release/office-toolbox_*_x64_portable.exe' -ErrorAction Stop
           $files | ForEach-Object {
             "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
-          } | Set-Content 'sha256sums.txt' -Encoding ascii
+          } | Set-Content 'sha256sums-windows.txt' -Encoding ascii
           $files | ForEach-Object {
             "$((Get-FileHash $_.FullName -Algorithm MD5).Hash.ToLower())  $($_.Name)"
-          } | Set-Content 'md5sums.txt' -Encoding ascii
-          Get-Content 'sha256sums.txt'
+          } | Set-Content 'md5sums-windows.txt' -Encoding ascii
+          Get-Content 'sha256sums-windows.txt'
 
-      - name: Create release
+      - name: Generate macOS checksums
+        if: startsWith(matrix.id, 'mac')
+        shell: bash
+        run: |
+          set -e
+          bundle="${{ matrix.bundle }}"
+          arch="${{ matrix.arch }}"
+          ver="${GITHUB_REF_NAME#v}"
+          file="office-toolbox_${ver}_${arch}.dmg"
+          (cd "$bundle/dmg" && shasum -a 256 "$file") > "sha256sums-macos-${arch}.txt"
+          (cd "$bundle/dmg" && md5 -r "$file") > "md5sums-macos-${arch}.txt"
+          cat "sha256sums-macos-${arch}.txt"
+
+      - name: Create Windows release
+        if: matrix.id == 'win'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
@@ -102,5 +159,18 @@ jobs:
           files: |
             src-tauri/target/release/bundle/nsis/office-toolbox_*_x64-setup.exe
             src-tauri/target/release/office-toolbox_*_x64_portable.exe
-            sha256sums.txt
-            md5sums.txt
+            sha256sums-windows.txt
+            md5sums-windows.txt
+
+      - name: Create macOS release
+        if: startsWith(matrix.id, 'mac')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "办公工具箱 ${{ github.ref_name }}"
+          draft: false
+          prerelease: false
+          files: |
+            ${{ matrix.bundle }}/dmg/office-toolbox_*_${{ matrix.arch }}.dmg
+            sha256sums-macos-${{ matrix.arch }}.txt
+            md5sums-macos-${{ matrix.arch }}.txt

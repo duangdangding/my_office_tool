@@ -12,7 +12,9 @@
     "mode": "auto",
     "executable": [
       "src-tauri/target/release/lscopy.exe",
-      "src-tauri/target/debug/lscopy.exe"
+      "src-tauri/target/debug/lscopy.exe",
+      "src-tauri/target/release/lscopy",
+      "src-tauri/target/debug/lscopy"
     ],
     "dev": {
       "program": "bun",

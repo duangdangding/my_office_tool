@@ -13,4 +13,7 @@ for index, (x, y) in enumerate(((53, 53), (139, 53), (53, 139), (139, 139))):
     draw.rounded_rectangle((x, y, x + 64, y + 64), radius=14, fill=colors[index])
 image.save(out / "icon.png")
 image.save(out / "icon.ico", sizes=[(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
+mac_image = image.resize((1024, 1024), Image.Resampling.LANCZOS)
+mac_image.save(out / "icon.icns", sizes=[(16, 16), (32, 32), (64, 64), (128, 128), (256, 256), (512, 512), (1024, 1024)])
 print(out / "icon.ico")
+print(out / "icon.icns")

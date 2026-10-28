@@ -7,8 +7,11 @@ const source = join(root, "plugins");
 const target = join(root, ".generated", "plugins");
 const ignoredDirectories = new Set([".git", "node_modules", "target", "dist", "build", ".next", "__pycache__", ".generated"]);
 
-rmSync(target, { recursive: true, force: true });
+// 保留发布根目录，避免 Windows 删除后立即重建时出现短暂 EPERM。
 mkdirSync(target, { recursive: true });
+for (const entry of readdirSync(target)) {
+  rmSync(join(target, entry), { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+}
 
 for (const entry of readdirSync(source, { withFileTypes: true })) {
   if (!entry.isDirectory() || !existsSync(join(source, entry.name, "office-plugin.json"))) continue;

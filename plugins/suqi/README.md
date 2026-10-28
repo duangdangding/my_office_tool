@@ -68,7 +68,7 @@
 
 ```bash
 bun install
-bun run tauri dev
+bun run tauri dev  # 前端使用独立端口 http://localhost:1431
 ```
 
 ## 构建

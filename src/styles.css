@@ -130,12 +130,22 @@ code { font-family: "Cascadia Code", Consolas, monospace; }
 .status-badge.running i { background: #52a77f; box-shadow: 0 0 0 3px rgba(82,167,127,.09); }
 .status-badge.detached { color: #5d7e9b; background: #eef4f8; }
 .status-badge.detached i { background: #6d93b3; }
+.status-badge.starting { color: #9a783e; background: #faf4e8; }
+.status-badge.starting i { background: #d2a452; animation: status-pulse 1.2s ease-in-out infinite; }
+.status-badge.failed { color: #b3514d; background: #fbedec; }
+.status-badge.failed i { background: #c96a64; }
+@keyframes status-pulse { 50% { opacity: .35; } }
 .source-badge { color: #8b9690; background: #fafbfa; border: 1px solid #ecefed; }
 .plugin-title { display: flex; align-items: baseline; gap: 8px; }
 .plugin-title h3 { margin: 0; color: #23332c; font-size: 16px; font-weight: 650; }
 .plugin-title span { color: #a1aba5; font-size: 9px; }
 .plugin-category { margin-top: 4px; color: #7d9b8c; font-size: 9px; }
 .plugin-description { min-height: 36px; margin: 12px 0 14px; color: #7e8984; font-size: 10px; line-height: 1.75; }
+.runtime-detail { display: flex; align-items: center; gap: 8px; margin: -3px 0 13px; padding: 9px 10px; border-radius: 7px; font-size: 9px; line-height: 1.55; }
+.runtime-detail.starting { color: #957640; background: #faf6ed; border: 1px solid #f0e6d2; }
+.runtime-detail.starting .spinner { flex: 0 0 auto; color: #b18a48; }
+.runtime-detail.failed { justify-content: space-between; color: #a75550; background: #fcf1f0; border: 1px solid #f1dedd; }
+.runtime-detail.failed button { flex: 0 0 auto; padding: 2px 0; color: #a34844; background: transparent; border: 0; font-size: 9px; text-decoration: underline; }
 .capability-row { display: flex; flex-wrap: wrap; gap: 5px; padding-bottom: 15px; }
 .capability-row span { display: inline-flex; align-items: center; gap: 4px; padding: 3px 6px; color: #88948e; background: #f6f8f6; border-radius: 4px; font-size: 8px; }
 .card-footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding-top: 13px; border-top: 1px solid #edf0ee; }
@@ -239,6 +249,9 @@ code { font-family: "Cascadia Code", Consolas, monospace; }
 .standalone-info b { display: flex; align-items: center; gap: 6px; font-size: 10px; }
 .standalone-info p { margin: 7px 0; color: #7e9186; font-size: 9px; line-height: 1.7; }
 .standalone-info code { display: block; overflow: hidden; color: #8b9b91; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
+.error-box { margin: 0 0 14px; padding: 12px 14px; color: #a34e49; background: #fcf1f0; border: 1px solid #efd9d7; border-radius: 9px; }
+.error-box b { font-size: 11px; }
+.error-box p { margin: 6px 0 0; font: 10px/1.65 "Cascadia Code", Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
 .log-view { min-height: 260px; max-height: 420px; overflow: auto; margin: 0; padding: 15px; color: #bcd1c5; background: #17241f; border-radius: 9px; font: 10px/1.65 "Cascadia Code", Consolas, monospace; white-space: pre-wrap; word-break: break-all; }
 
 #toast-root { position: fixed; z-index: 200; right: 24px; bottom: 24px; display: flex; flex-direction: column; gap: 9px; pointer-events: none; }

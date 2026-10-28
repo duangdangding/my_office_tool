@@ -28,8 +28,8 @@
   },
   "bundle": {
     "active": true,
-    "targets": "nsis",
-    "icon": ["icons/icon.ico"],
+    "targets": ["nsis", "dmg", "app"],
+    "icon": ["icons/icon.ico", "icons/icon.png", "icons/icon.icns"],
     "resources": {
       "../.generated/plugins/": "plugins/"
     }

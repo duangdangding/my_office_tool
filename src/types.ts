@@ -1,5 +1,5 @@
 export type PluginSource = "builtin" | "imported";
-export type PluginStatus = "stopped" | "running" | "detached";
+export type PluginStatus = "stopped" | "starting" | "running" | "detached" | "failed";
 
 export interface PluginRules {
   enabled: boolean;

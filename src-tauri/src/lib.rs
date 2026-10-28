@@ -6,7 +6,11 @@ use std::{
     process::{Child, Command, Stdio},
     sync::Mutex,
 };
-use tauri::{AppHandle, Manager, State};
+use tauri::{
+    menu::{Menu, MenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    AppHandle, Manager, State,
+};
 
 const MANIFEST_FILE: &str = "office-plugin.json";
 const RULES_FILE: &str = "rules.json";
@@ -107,6 +111,11 @@ impl PluginRuntime {
     fn stopped() -> Self {
         Self { status: "stopped".into(), pid: None, detail: None }
     }
+
+    fn new(status: &str, pid: Option<u32>, detail: impl Into<String>) -> Self {
+        let detail = detail.into();
+        Self { status: status.into(), pid, detail: (!detail.is_empty()).then_some(detail) }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -122,8 +131,9 @@ struct PluginView {
 struct AppState {
     data_dir: PathBuf,
     rules: Mutex<HashMap<String, PluginRules>>,
+    runtimes: Mutex<HashMap<String, PluginRuntime>>,
     running: Mutex<HashMap<String, Child>>,
-    detached: Mutex<HashMap<String, u32>>,
+    detached: Mutex<HashMap<String, Child>>,
 }
 
 fn yes() -> bool { true }
@@ -208,33 +218,94 @@ fn read_manifest(root: &Path) -> Result<PluginManifest, String> {
     Ok(manifest)
 }
 
+fn set_runtime(state: &AppState, id: &str, runtime: PluginRuntime) -> PluginRuntime {
+    state.runtimes.lock().unwrap().insert(id.into(), runtime.clone());
+    runtime
+}
+
+fn exited_runtime(
+    state: &AppState,
+    id: &str,
+    result: Result<std::process::ExitStatus, String>,
+    starting: bool,
+    detached: bool,
+) -> PluginRuntime {
+    let runtime = match result {
+        Ok(status) if status.success() && !starting => PluginRuntime::new(
+            "stopped",
+            None,
+            if detached { "独立插件已退出" } else { "插件已退出" },
+        ),
+        Ok(status) => PluginRuntime::new(
+            "failed",
+            None,
+            if starting {
+                format!("插件在就绪前退出（{status}），请查看编译与启动日志")
+            } else {
+                format!("插件异常退出（{status}），请查看运行日志")
+            },
+        ),
+        Err(error) => PluginRuntime::new("failed", None, error),
+    };
+    set_runtime(state, id, runtime)
+}
+
 fn runtime_for(state: &AppState, id: &str) -> PluginRuntime {
-    let mut exit_detail = None;
+    let previous = state.runtimes.lock().unwrap().get(id).cloned().unwrap_or_else(PluginRuntime::stopped);
+    let starting = previous.status == "starting";
+    let mut managed_exit = None;
     {
         let mut running = state.running.lock().unwrap();
         if let Some(child) = running.get_mut(id) {
             let pid = child.id();
             match child.try_wait() {
-                Ok(Some(status)) => exit_detail = Some(format!("进程已退出（{status}）")),
-                Ok(None) => return PluginRuntime { status: "running".into(), pid: Some(pid), detail: None },
-                Err(error) => exit_detail = Some(format!("读取进程状态失败：{error}")),
+                Ok(Some(status)) => managed_exit = Some(Ok(status)),
+                Ok(None) => {
+                    if previous.pid == Some(pid) && matches!(previous.status.as_str(), "starting" | "running") {
+                        return previous;
+                    }
+                    return PluginRuntime::new("running", Some(pid), "插件进程运行中");
+                }
+                Err(error) => managed_exit = Some(Err(format!("读取插件进程状态失败：{error}"))),
             }
         }
-        if exit_detail.is_some() {
+        if managed_exit.is_some() {
             running.remove(id);
         }
     }
-    if let Some(detail) = exit_detail {
-        return PluginRuntime { status: "stopped".into(), pid: None, detail: Some(detail) };
+    if let Some(result) = managed_exit {
+        return exited_runtime(state, id, result, starting, false);
     }
-    if let Some(pid) = state.detached.lock().unwrap().get(id).copied() {
-        return PluginRuntime { status: "detached".into(), pid: Some(pid), detail: Some("独立进程由插件自行管理".into()) };
+
+    let mut detached_exit = None;
+    {
+        let mut detached = state.detached.lock().unwrap();
+        if let Some(child) = detached.get_mut(id) {
+            let pid = child.id();
+            match child.try_wait() {
+                Ok(Some(status)) => detached_exit = Some(Ok(status)),
+                Ok(None) => return PluginRuntime::new("detached", Some(pid), "独立进程由插件自行管理"),
+                Err(error) => detached_exit = Some(Err(format!("读取独立插件进程状态失败：{error}"))),
+            }
+        }
+        if detached_exit.is_some() {
+            detached.remove(id);
+        }
     }
-    PluginRuntime::stopped()
+    if let Some(result) = detached_exit {
+        return exited_runtime(state, id, result, false, true);
+    }
+    previous
 }
 
 fn plugin_roots(app: &AppHandle, state: &AppState) -> Vec<(PathBuf, String)> {
     let mut roots = Vec::new();
+    // 开发时优先使用当前源码，避免 target/debug/plugins 中残留的旧副本覆盖源码插件。
+    #[cfg(debug_assertions)]
+    {
+        let dev_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap_or(Path::new(".")).join("plugins");
+        roots.push((dev_root, "builtin".into()));
+    }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             roots.push((dir.join("plugins"), "builtin".into()));
@@ -243,8 +314,6 @@ fn plugin_roots(app: &AppHandle, state: &AppState) -> Vec<(PathBuf, String)> {
     if let Ok(dir) = app.path().resource_dir() {
         roots.push((dir.join("plugins"), "builtin".into()));
     }
-    let dev_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap_or(Path::new(".")).join("plugins");
-    roots.push((dev_root, "builtin".into()));
     roots.push((state.data_dir.join("plugins"), "imported".into()));
 
     let mut seen = HashSet::new();
@@ -307,14 +376,16 @@ fn resolve_program(program: &str) -> String {
     program.into()
 }
 
-fn prepare_launch(plugin: &PluginView) -> Result<(String, Vec<String>, PathBuf), String> {
+fn prepare_launch(plugin: &PluginView) -> Result<(String, Vec<String>, PathBuf, bool), String> {
     let root = PathBuf::from(&plugin.root);
     let entry = &plugin.manifest.entry;
-    if entry.mode != "dev" {
+    // 开发宿主中的内置插件始终走 dev 命令，确保配置和源码更新生效，同时复用编译缓存。
+    let prefer_dev = cfg!(debug_assertions) && plugin.source == "builtin" && entry.dev.is_some();
+    if entry.mode != "dev" && !prefer_dev {
         for candidate in &entry.executable {
             let executable = safe_join(&root, candidate)?;
             if executable.is_file() {
-                return Ok((executable.to_string_lossy().to_string(), vec![], root));
+                return Ok((executable.to_string_lossy().to_string(), vec![], root, false));
             }
         }
     }
@@ -324,10 +395,31 @@ fn prepare_launch(plugin: &PluginView) -> Result<(String, Vec<String>, PathBuf),
             if !cwd.is_dir() {
                 return Err(format!("插件工作目录不存在：{}", cwd.display()));
             }
-            return Ok((resolve_program(&command.program), command.args.clone(), cwd));
+            return Ok((resolve_program(&command.program), command.args.clone(), cwd, true));
         }
     }
     Err("未找到已构建的插件程序；请先构建插件，或提供有效的 dev 启动命令".into())
+}
+
+fn read_log(path: &Path) -> String {
+    let Ok(bytes) = fs::read(path) else { return String::new() };
+    let start = bytes.len().saturating_sub(64 * 1024);
+    String::from_utf8_lossy(&bytes[start..]).into_owned()
+}
+
+fn log_tail(path: &Path) -> String {
+    let text = read_log(path);
+    let tail: String = text.chars().rev().take(5000).collect::<String>().chars().rev().collect();
+    if tail.trim().is_empty() { "暂无输出，请检查插件程序、依赖和权限。".into() } else { tail }
+}
+
+fn output_is_ready(output: &str, id: &str) -> bool {
+    let marker = format!("OFFICE_TOOLBOX_READY:{id}");
+    output.lines().any(|line| line.trim() == marker)
+}
+
+fn plugin_is_ready(path: &Path, id: &str) -> bool {
+    output_is_ready(&read_log(path), id)
 }
 
 fn launch_by_id(app: &AppHandle, state: &AppState, id: &str, detached: Option<bool>) -> Result<PluginRuntime, String> {
@@ -336,11 +428,13 @@ fn launch_by_id(app: &AppHandle, state: &AppState, id: &str, detached: Option<bo
         return Err("插件已停用，请先在规则中启用".into());
     }
     let current = runtime_for(state, id);
-    if current.status == "running" {
+    if matches!(current.status.as_str(), "starting" | "running" | "detached") {
         return Ok(current);
     }
     let detach = detached.unwrap_or(plugin.rules.detach);
-    let (program, args, cwd) = prepare_launch(&plugin)?;
+    let (program, args, cwd, dev_mode) = prepare_launch(&plugin).inspect_err(|error| {
+        set_runtime(state, id, PluginRuntime::new("failed", None, error.clone()));
+    })?;
     let plugin_data = state.data_dir.join("plugin-data").join(id);
     let log_dir = state.data_dir.join("logs");
     fs::create_dir_all(&plugin_data).map_err(|e| format!("创建插件数据目录失败：{e}"))?;
@@ -348,7 +442,11 @@ fn launch_by_id(app: &AppHandle, state: &AppState, id: &str, detached: Option<bo
     let rules_path = plugin_data.join("rules.json");
     fs::write(&rules_path, serde_json::to_vec_pretty(&plugin.rules).map_err(|e| e.to_string())?).map_err(|e| format!("写入插件规则失败：{e}"))?;
 
-    let log = fs::OpenOptions::new().create(true).append(true).open(log_dir.join(format!("{id}.log"))).map_err(|e| format!("打开插件日志失败：{e}"))?;
+    let log_path = log_dir.join(format!("{id}.log"));
+    let mut log = fs::OpenOptions::new().create(true).write(true).truncate(true).open(&log_path).map_err(|e| format!("打开插件日志失败：{e}"))?;
+    use std::io::Write;
+    writeln!(log, "[办公工具箱] 启动命令：{program}；工作目录：{}", cwd.display()).map_err(|e| format!("写入插件日志失败：{e}"))?;
+    writeln!(log, "[办公工具箱] 正在等待插件就绪，首次开发启动可能需要编译，请耐心等待。").map_err(|e| format!("写入插件日志失败：{e}"))?;
     let error_log = log.try_clone().map_err(|e| e.to_string())?;
     let mut command = Command::new(&program);
     command
@@ -367,16 +465,76 @@ fn launch_by_id(app: &AppHandle, state: &AppState, id: &str, detached: Option<bo
         .env("OFFICE_PLUGIN_ALLOW_GLOBAL_SHORTCUT", plugin.rules.allow_global_shortcut.to_string())
         .env("OFFICE_PLUGIN_ALLOW_AUTOSTART", plugin.rules.allow_plugin_autostart.to_string());
     hide_console(&mut command);
-    let child = command.spawn().map_err(|e| format!("启动插件失败（{program}）：{e}"))?;
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let detail = format!("无法创建插件进程（{program}）：{error}。请检查程序路径和依赖环境。");
+            set_runtime(state, id, PluginRuntime::new("failed", None, detail.clone()));
+            return Err(detail);
+        }
+    };
     let pid = child.id();
     if detach {
         state.running.lock().unwrap().remove(id);
-        state.detached.lock().unwrap().insert(id.into(), pid);
-        Ok(PluginRuntime { status: "detached".into(), pid: Some(pid), detail: Some("独立进程由插件自行管理".into()) })
-    } else {
-        state.detached.lock().unwrap().remove(id);
-        state.running.lock().unwrap().insert(id.into(), child);
-        Ok(PluginRuntime { status: "running".into(), pid: Some(pid), detail: None })
+        state.detached.lock().unwrap().insert(id.into(), child);
+        return Ok(set_runtime(state, id, PluginRuntime::new("detached", Some(pid), "独立进程由插件自行管理")));
+    }
+
+    state.detached.lock().unwrap().remove(id);
+    state.running.lock().unwrap().insert(id.into(), child);
+    set_runtime(state, id, PluginRuntime::new(
+        "starting",
+        Some(pid),
+        if dev_mode { "正在编译并启动插件，首次运行可能较慢" } else { "正在启动插件并等待就绪" },
+    ));
+
+    let started = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(if dev_mode { 30 * 60 } else { 30 });
+    loop {
+        let check = {
+            let mut running = state.running.lock().unwrap();
+            running.get_mut(id).map(|child| child.try_wait())
+        };
+        let Some(check) = check else {
+            let current = runtime_for(state, id);
+            if current.status == "failed" {
+                return Err(current.detail.unwrap_or_else(|| "插件启动失败，请查看日志".into()));
+            }
+            return Err("插件启动已取消。".into());
+        };
+        match check {
+            Ok(Some(status)) => {
+                state.running.lock().unwrap().remove(id);
+                let detail = format!("插件启动或编译失败（{status}）。\n\n最近日志：\n{}", log_tail(&log_path));
+                set_runtime(state, id, PluginRuntime::new("failed", None, "插件启动或编译失败，请查看详细日志"));
+                return Err(detail);
+            }
+            Err(error) => {
+                state.running.lock().unwrap().remove(id);
+                let detail = format!("读取启动中的插件进程失败：{error}");
+                set_runtime(state, id, PluginRuntime::new("failed", None, detail.clone()));
+                return Err(detail);
+            }
+            Ok(None) => {}
+        }
+
+        if plugin_is_ready(&log_path, id) {
+            if !state.running.lock().unwrap().contains_key(id) {
+                return Err("插件启动已取消。".into());
+            }
+            return Ok(set_runtime(state, id, PluginRuntime::new("running", Some(pid), "插件已就绪")));
+        }
+        // 未适配就绪信号的单文件插件保持兼容；开发命令必须等待明确信号。
+        if !dev_mode && started.elapsed() >= std::time::Duration::from_secs(2) {
+            return Ok(set_runtime(state, id, PluginRuntime::new("running", Some(pid), "进程运行中；插件未提供就绪信号")));
+        }
+        if started.elapsed() >= timeout {
+            let _ = stop_tracked(state, id);
+            let detail = format!("等待插件就绪超过 {} 秒，已停止启动。\n\n最近日志：\n{}", timeout.as_secs(), log_tail(&log_path));
+            set_runtime(state, id, PluginRuntime::new("failed", None, "等待插件就绪超时，请查看详细日志"));
+            return Err(detail);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
     }
 }
 
@@ -394,6 +552,7 @@ fn stop_tracked(state: &AppState, id: &str) -> Result<bool, String> {
     }
     let _ = child.kill();
     let _ = child.wait();
+    set_runtime(state, id, PluginRuntime::new("stopped", None, "插件已手动停止"));
     Ok(true)
 }
 
@@ -458,7 +617,7 @@ fn update_plugin_rules(app: AppHandle, state: State<'_, AppState>, id: String, r
     find_plugin(&app, &state, &id)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn launch_plugin(app: AppHandle, state: State<'_, AppState>, id: String, detached: Option<bool>) -> Result<PluginRuntime, String> {
     launch_by_id(&app, &state, &id, detached)
 }
@@ -501,11 +660,8 @@ fn read_plugin_log(state: State<'_, AppState>, id: String) -> String {
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_')) {
         return "插件 id 无效。".into();
     }
-    let path = state.data_dir.join("logs").join(format!("{id}.log"));
-    let Ok(bytes) = fs::read(path) else { return "暂无运行日志。".into() };
-    let start = bytes.len().saturating_sub(64 * 1024);
-    let text = String::from_utf8_lossy(&bytes[start..]);
-    if text.trim().is_empty() { "暂无运行日志。".into() } else { text.into() }
+    let text = read_log(&state.data_dir.join("logs").join(format!("{id}.log")));
+    if text.trim().is_empty() { "暂无运行日志。".into() } else { text }
 }
 
 fn stop_all(state: &AppState) {
@@ -515,12 +671,21 @@ fn stop_all(state: &AppState) {
     }
 }
 
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let data_dir = default_data_dir();
     let state = AppState {
         rules: Mutex::new(load_rules(&data_dir)),
         data_dir,
+        runtimes: Mutex::new(HashMap::new()),
         running: Mutex::new(HashMap::new()),
         detached: Mutex::new(HashMap::new()),
     };
@@ -538,6 +703,42 @@ pub fn run() {
             read_plugin_log,
         ])
         .setup(|app| {
+            let show = MenuItem::with_id(app, "show", "显示办公工具箱", true, None::<&str>)?;
+            let hide = MenuItem::with_id(app, "hide", "隐藏窗口", true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show, &hide, &quit])?;
+            TrayIconBuilder::new()
+                .icon(app.default_window_icon().unwrap().clone())
+                .menu(&menu)
+                .tooltip("办公工具箱")
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "show" => show_main_window(app),
+                    "hide" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.hide();
+                        }
+                    }
+                    "quit" => app.exit(0),
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if matches!(event, TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. }) {
+                        show_main_window(tray.app_handle());
+                    }
+                })
+                .build(app)?;
+
+            // 关闭按钮只隐藏窗口；从托盘「退出」才会结束主程序和托管插件。
+            if let Some(window) = app.get_webview_window("main") {
+                let window_handle = window.clone();
+                window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = window_handle.hide();
+                    }
+                });
+            }
+
             let state = app.state::<AppState>();
             let ids: Vec<String> = discover_plugins(app.handle(), &state)
                 .into_iter()
@@ -545,7 +746,11 @@ pub fn run() {
                 .map(|plugin| plugin.manifest.id)
                 .collect();
             for id in ids {
-                let _ = launch_by_id(app.handle(), &state, &id, None);
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    let state = handle.state::<AppState>();
+                    let _ = launch_by_id(&handle, &state, &id, None);
+                });
             }
             Ok(())
         })
@@ -600,5 +805,44 @@ mod tests {
         assert!(!rules.detach);
         assert!(!rules.auto_start);
         assert!(!rules.allow_plugin_autostart);
+    }
+
+    #[test]
+    fn ready_marker_must_match_exact_plugin() {
+        assert!(output_is_ready("Compiling demo\nOFFICE_TOOLBOX_READY:demo-tool\n", "demo-tool"));
+        assert!(!output_is_ready("OFFICE_TOOLBOX_READY:other\n", "demo-tool"));
+        assert!(!output_is_ready("prefix OFFICE_TOOLBOX_READY:demo-tool\n", "demo-tool"));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn debug_builtin_plugins_prefer_current_dev_command() {
+        let mut manifest = manifest();
+        manifest.entry.mode = "auto".into();
+        manifest.entry.executable = vec!["Cargo.toml".into()];
+        let plugin = PluginView {
+            manifest,
+            root: env!("CARGO_MANIFEST_DIR").into(),
+            source: "builtin".into(),
+            rules: PluginRules::default(),
+            runtime: PluginRuntime::stopped(),
+        };
+        let (_, args, _, dev_mode) = prepare_launch(&plugin).unwrap();
+        assert!(dev_mode);
+        assert_eq!(args, vec!["index.js"]);
+    }
+
+    #[test]
+    fn process_errors_become_persistent_failed_state() {
+        let state = AppState {
+            data_dir: PathBuf::from("."),
+            rules: Mutex::new(HashMap::new()),
+            runtimes: Mutex::new(HashMap::new()),
+            running: Mutex::new(HashMap::new()),
+            detached: Mutex::new(HashMap::new()),
+        };
+        let runtime = exited_runtime(&state, "demo-tool", Err("编译进程读取失败".into()), true, false);
+        assert_eq!(runtime.status, "failed");
+        assert_eq!(runtime_for(&state, "demo-tool").detail.as_deref(), Some("编译进程读取失败"));
     }
 }

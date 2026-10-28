@@ -3888,6 +3888,7 @@ pub fn run() {
             relay::start(app.handle());
             // 启动安全锁定模块（自动锁定计时线程）
             lock::start(app.handle());
+            office_plugin::ready();
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

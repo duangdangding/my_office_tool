@@ -51,15 +51,14 @@ export async function saveRules(id: string, rules: PluginRules): Promise<PluginV
   return clone(plugin);
 }
 
-export async function launchPlugin(id: string, detached?: boolean): Promise<void> {
-  if (isDesktop) {
-    await invoke("launch_plugin", { id, detached });
-    return;
-  }
+export async function launchPlugin(id: string, detached?: boolean): Promise<PluginView["runtime"]> {
+  if (isDesktop) return invoke<PluginView["runtime"]>("launch_plugin", { id, detached });
   const plugin = mockPlugins.find((item) => item.manifest.id === id);
   if (!plugin) throw new Error("插件不存在");
   if (!plugin.rules.enabled) throw new Error("插件已停用，请先在规则中启用。");
+  await new Promise((resolve) => window.setTimeout(resolve, 700));
   plugin.runtime = { status: detached || plugin.rules.detach ? "detached" : "running", pid: 30000 + Math.floor(Math.random() * 1000), detail: null };
+  return clone(plugin.runtime);
 }
 
 export async function stopPlugin(id: string): Promise<void> {

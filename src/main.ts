@@ -91,15 +91,28 @@ app.innerHTML = `
   </main>`;
 
 function statusMeta(status: PluginStatus): { label: string; className: string } {
+  if (status === "starting") return { label: "启动中", className: "starting" };
   if (status === "running") return { label: "运行中", className: "running" };
   if (status === "detached") return { label: "独立运行", className: "detached" };
+  if (status === "failed") return { label: "启动失败", className: "failed" };
   return { label: "未运行", className: "stopped" };
 }
 
 function pluginCard(plugin: PluginView): string {
   const { manifest, rules, runtime } = plugin;
-  const status = statusMeta(runtime.status);
   const busy = busyId === manifest.id;
+  const starting = runtime.status === "starting" || (busy && runtime.status === "stopped");
+  const status = statusMeta(starting ? "starting" : runtime.status);
+  let actionButton: string;
+  if (runtime.status === "running") {
+    actionButton = `<button class="button subtle" data-action="stop" data-id="${manifest.id}" ${busy ? "disabled" : ""}>${icon("stop", 15)}停止</button>`;
+  } else if (starting) {
+    actionButton = `<button class="button subtle" data-action="stop" data-id="${manifest.id}">${icon("stop", 15)}取消启动</button>`;
+  } else if (runtime.status === "detached") {
+    actionButton = `<button class="button subtle" data-action="open-dir" data-id="${manifest.id}">${icon("external", 15)}独立运行中</button>`;
+  } else {
+    actionButton = `<button class="button launch" data-action="launch" data-id="${manifest.id}" ${!rules.enabled || busy ? "disabled" : ""}>${icon("play", 15)}${runtime.status === "failed" ? "重试" : "启动"}</button>`;
+  }
   return `<article class="plugin-card ${!rules.enabled ? "disabled" : ""}">
     <div class="card-top">
       <div class="plugin-icon ${manifest.icon}">${icon(manifest.icon, 28)}</div>
@@ -108,24 +121,25 @@ function pluginCard(plugin: PluginView): string {
     <div class="plugin-title"><h3>${escape(manifest.name)}</h3><span>v${escape(manifest.version)}</span></div>
     <div class="plugin-category">${escape(manifest.category || "办公效率")}</div>
     <p class="plugin-description">${escape(manifest.description)}</p>
+    ${starting ? `<div class="runtime-detail starting"><span class="spinner"></span><span>${escape(runtime.detail || "正在创建插件进程，请稍候")}</span></div>` : runtime.status === "failed" ? `<div class="runtime-detail failed"><span>${escape(runtime.detail || "插件启动失败")}</span><button data-action="log" data-id="${manifest.id}">详细日志</button></div>` : ""}
     <div class="capability-row"><span>${icon("box", 14)}独立进程</span>${manifest.permissions.slice(0, 2).map((item) => `<span>${escape(permissionLabel(item))}</span>`).join("")}</div>
     <div class="card-footer">
-      <label class="mini-switch" title="${rules.enabled ? "停用插件" : "启用插件"}"><input type="checkbox" data-action="toggle" data-id="${manifest.id}" ${rules.enabled ? "checked" : ""} ${busy ? "disabled" : ""}/><span></span><em>${rules.enabled ? "已启用" : "已停用"}</em></label>
+      <label class="mini-switch" title="${rules.enabled ? "停用插件" : "启用插件"}"><input type="checkbox" data-action="toggle" data-id="${manifest.id}" ${rules.enabled ? "checked" : ""} ${busy || starting ? "disabled" : ""}/><span></span><em>${rules.enabled ? "已启用" : "已停用"}</em></label>
       <div class="card-actions">
         <button class="icon-button" data-action="rules" data-id="${manifest.id}" title="插件规则">${icon("sliders", 18)}</button>
         <button class="icon-button" data-action="standalone" data-id="${manifest.id}" title="独立启动（不托管）" ${!rules.enabled || busy || runtime.status !== "stopped" ? "disabled" : ""}>${icon("external", 17)}</button>
-        ${runtime.status === "running" ? `<button class="button subtle" data-action="stop" data-id="${manifest.id}" ${busy ? "disabled" : ""}>${icon("stop", 15)}停止</button>` : runtime.status === "detached" ? `<button class="button subtle" data-action="open-dir" data-id="${manifest.id}">${icon("external", 15)}独立运行中</button>` : `<button class="button launch" data-action="launch" data-id="${manifest.id}" ${!rules.enabled || busy ? "disabled" : ""}>${busy ? '<span class="spinner"></span>启动中' : `${icon("play", 15)}启动`}</button>`}
+        ${actionButton}
       </div>
     </div>
   </article>`;
 }
 
 function dashboardContent(): string {
-  const running = plugins.filter((plugin) => plugin.runtime.status !== "stopped").length;
+  const running = plugins.filter((plugin) => ["starting", "running", "detached"].includes(plugin.runtime.status)).length;
   const autoStart = plugins.filter((plugin) => plugin.rules.autoStart && plugin.rules.enabled).length;
   const needle = query.trim().toLowerCase();
   let shown = plugins.filter((plugin) => [plugin.manifest.name, plugin.manifest.description, plugin.manifest.category].join(" ").toLowerCase().includes(needle));
-  if (currentView === "running") shown = shown.filter((plugin) => plugin.runtime.status !== "stopped");
+  if (currentView === "running") shown = shown.filter((plugin) => ["starting", "running", "detached"].includes(plugin.runtime.status));
   return `<section class="page-heading"><div><p class="eyebrow">YOUR WORKSPACE</p><h1>${currentView === "running" ? "正在运行" : "让办公，更得心应手"}</h1><p>${currentView === "running" ? "查看和管理已启动的独立工具。" : "把常用工具放在一个空间，各自独立，又彼此有序。"}</p></div><div class="heading-art"><span></span><span></span>${icon("box", 28)}</div></section>
     <section class="stats-row">
       <div class="stat"><span class="stat-icon green">${icon("puzzle", 21)}</span><div><b>${plugins.length}</b><small>已安装工具</small></div><span class="stat-note">个</span></div>
@@ -145,7 +159,7 @@ function rulesContent(): string {
 function aboutContent(): string {
   return `<section class="page-heading compact"><div><p class="eyebrow">OPEN & INDEPENDENT</p><h1>一个开放的小型办公生态</h1><p>工具箱不接管插件的窗口与数据，只提供统一的入口和运行规则。</p></div></section>
     <section class="architecture-card"><div class="architecture-copy"><span class="section-kicker">运行架构</span><h2>相互独立，才能稳定协作</h2><p>每个工具都是独立进程。一个插件崩溃不会拖垮工具箱；插件也可以脱离本体，使用原来的方式开发、构建和运行。</p><div class="architecture-points"><span>${icon("check", 16)}标准 JSON 清单</span><span>${icon("check", 16)}独立数据目录</span><span>${icon("check", 16)}托管 / 独立双模式</span></div></div><div class="architecture-diagram"><div class="host-node">${icon("grid", 23)}<b>办公工具箱</b><small>规则 · 启停 · 日志</small></div><div class="diagram-lines"><i></i><i></i></div><div class="child-nodes"><span>${icon("rocket", 20)}速启</span><span>${icon("clipboard", 20)}共享剪贴板</span><span>${icon("puzzle", 20)}你的插件</span></div></div></section>
-    <section class="spec-card"><div><span class="section-kicker">PLUGIN MANIFEST V1</span><h2>三步接入你的插件</h2></div><ol class="spec-steps"><li><span>01</span><div><b>添加插件清单</b><p>在插件根目录创建 <code>office-plugin.json</code>，声明 id、名称、版本和启动命令。</p></div></li><li><span>02</span><div><b>声明启动方式</b><p><code>executable</code> 指向已构建程序；<code>dev</code> 声明开发命令；<code>auto</code> 优先程序、回退开发命令。</p></div></li><li><span>03</span><div><b>读取协作规则</b><p>插件启动时读取 <code>OFFICE_PLUGIN_RULES_FILE</code>，或对应的 <code>OFFICE_PLUGIN_ALLOW_*</code> 环境变量。</p></div></li></ol><div class="env-example"><code>OFFICE_PLUGIN_ID=suqi</code><code>OFFICE_PLUGIN_ALLOW_NETWORK=true</code><code>OFFICE_PLUGIN_ALLOW_CLIPBOARD=true</code><code>OFFICE_PLUGIN_DATA_DIR=…</code></div></section>`;
+    <section class="spec-card"><div><span class="section-kicker">PLUGIN MANIFEST V1</span><h2>三步接入你的插件</h2></div><ol class="spec-steps"><li><span>01</span><div><b>添加插件清单</b><p>在插件根目录创建 <code>office-plugin.json</code>，声明 id、名称、版本和启动命令。</p></div></li><li><span>02</span><div><b>声明启动方式</b><p><code>executable</code> 指向已构建程序；<code>dev</code> 声明开发命令；<code>auto</code> 优先程序、回退开发命令。</p></div></li><li><span>03</span><div><b>读取规则并报告就绪</b><p>读取 <code>OFFICE_PLUGIN_RULES_FILE</code> 和 <code>OFFICE_PLUGIN_ALLOW_*</code>；初始化完成后输出 <code>OFFICE_TOOLBOX_READY:插件id</code>。</p></div></li></ol><div class="env-example"><code>OFFICE_PLUGIN_ID=suqi</code><code>OFFICE_PLUGIN_ALLOW_NETWORK=true</code><code>OFFICE_PLUGIN_ALLOW_CLIPBOARD=true</code><code>OFFICE_PLUGIN_DATA_DIR=…</code></div></section>`;
 }
 
 const viewTitles: Record<ViewKey, [string, string]> = {
@@ -164,12 +178,16 @@ function render(): void {
   document.title = `${viewTitles[currentView][0]} · 办公工具箱`;
 }
 
+let refreshing = false;
 async function refresh(): Promise<void> {
+  if (refreshing) return;
+  refreshing = true;
   try {
     plugins = await listPlugins();
   } catch (error) {
     toast(String(error), "error");
   } finally {
+    refreshing = false;
     loading = false;
     render();
   }
@@ -203,23 +221,38 @@ function showRules(id: string): void {
   </form>`, "rules-modal");
 }
 
-async function showLog(id: string): Promise<void> {
+async function showLog(id: string, errorMessage?: string): Promise<void> {
   const plugin = plugins.find((item) => item.manifest.id === id);
-  showModal(`<button class="modal-close" data-action="close-modal">${icon("close")}</button><h2>${escape(plugin?.manifest.name ?? id)}运行日志</h2><p class="modal-intro">仅保留最近 64 KB 输出，便于排查启动问题。</p><pre class="log-view">正在读取日志…</pre><div class="modal-actions"><button class="button subtle" data-action="rules" data-id="${id}">返回规则</button><button class="button primary" data-action="close-modal">完成</button></div>`);
-  const log = await readPluginLog(id);
+  showModal(`<button class="modal-close" data-action="close-modal">${icon("close")}</button><h2>${escape(plugin?.manifest.name ?? id)}${errorMessage ? "启动失败" : "运行日志"}</h2><p class="modal-intro">仅保留最近 64 KB 输出，便于排查编译与启动问题。</p>${errorMessage ? `<div class="error-box"><b>详细错误</b><p>${escape(errorMessage)}</p></div>` : ""}<pre class="log-view">正在读取日志…</pre><div class="modal-actions"><button class="button subtle" data-action="rules" data-id="${id}">返回规则</button><button class="button primary" data-action="close-modal">完成</button></div>`, "rules-modal");
   const view = modalRoot.querySelector<HTMLElement>(".log-view");
-  if (view) view.textContent = log;
+  try {
+    const log = await readPluginLog(id);
+    if (view) view.textContent = log;
+  } catch (error) {
+    if (view) view.textContent = `读取日志失败：${String(error)}`;
+  }
 }
 
 async function runPlugin(id: string, detached?: boolean): Promise<void> {
   busyId = id;
+  const plugin = plugins.find((item) => item.manifest.id === id);
+  if (plugin && !detached) {
+    plugin.runtime = { status: "starting", pid: null, detail: "正在创建插件进程，首次开发启动可能需要编译" };
+  }
   render();
   try {
     await launchPlugin(id, detached);
     await refresh();
-    toast(detached ? "插件已独立启动，可脱离工具箱运行。" : "插件已启动。", "success");
+    toast(detached ? "插件已独立启动，可脱离工具箱运行。" : "插件已就绪。", "success");
   } catch (error) {
-    toast(String(error), "error");
+    const message = String(error);
+    await refresh();
+    if (message.includes("启动已取消")) {
+      toast("已取消插件启动。", "info");
+    } else {
+      toast("插件启动失败，请查看详细错误与日志。", "error");
+      await showLog(id, message);
+    }
   } finally {
     busyId = "";
     render();
@@ -339,3 +372,8 @@ document.addEventListener("keydown", (event) => {
 });
 
 void refresh();
+if (isDesktop) {
+  window.setInterval(() => {
+    if (!document.hidden) void refresh();
+  }, 1000);
+}

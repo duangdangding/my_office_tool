@@ -4,7 +4,7 @@
 
 ## 项目简介
 
-**办公工具箱（office-toolbox）**——Windows 本地办公工具宿主，基于 **Tauri 2 + Vanilla TypeScript + Rust**。
+**办公工具箱（office-toolbox）**——Windows／macOS 本地办公工具宿主，基于 **Tauri 2 + Vanilla TypeScript + Rust**。
 
 - 通过 `office-plugin.json` 发现和导入独立进程插件。
 - 支持插件启停、运行规则、日志、托管启动和独立启动。
@@ -21,7 +21,7 @@
 | `plugins/suqi`、`plugins/lscopy` | 各自沿用原项目的 **bun** 和独立构建体系 |
 | `scripts/prepare-bundled-plugins.mjs` | 生成发布用插件源码，排除依赖、缓存和数据 |
 | `.generated/plugins/` | 自动生成的打包资源，不手工编辑、不提交 |
-| `.github/workflows/release.yml` | Windows Release 构建与发布 |
+| `.github/workflows/release.yml` | Windows 与 macOS Release 构建发布 |
 
 ## 常用命令
 
@@ -30,12 +30,11 @@ npm install
 npm run dev                 # 仅启动网页预览
 npm run build               # TypeScript + Vite，提交前必跑
 npm run tauri dev           # 完整桌面应用
-npm run tauri build         # Windows 安装包
 cargo test --manifest-path src-tauri/Cargo.toml
 cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
 ```
 
-插件目录仍使用原项目命令，例如 `cd plugins/suqi && bun install && bun run build`。不要用主程序的 npm 依赖替代插件自己的依赖。
+插件目录仍使用原项目命令，例如 `cd plugins/suqi && bun install && bun run build`。不要用主程序的 npm 依赖替代插件自己的依赖。开发宿主必须从 `plugins/` 源码目录启动内置插件，主程序／速启／共享剪贴板前端端口固定为 `1420`／`1431`／`1441`，不要复用同一端口。
 
 ## 代码与文档约定
 
@@ -56,6 +55,8 @@ npm run release:check
 ```
 
 如果修改了插件，还需进入对应插件目录执行其 `bun run build` 和 Rust 检查。桌面交互改动应真机验证，不要用网页预览代替托盘、快捷键、进程启停等桌面验收。
+
+**助手不得在本地打包本仓库的 Windows 安装包**，包括主程序和插件的 Windows Tauri 打包命令。Windows 安装包只通过 GitHub Actions 标签发版构建；本地仅做前端、测试、Clippy／`cargo check` 和必要的桌面运行验证。
 
 ## 提交与推送
 
@@ -80,7 +81,7 @@ git push origin main
    git push origin vX.Y.Z
    ```
 
-4. `v*` 标签触发 `.github/workflows/release.yml`，产出 Windows NSIS 安装包、便携版 exe、`sha256sums.txt` 和 `md5sums.txt`。Release 资产使用 ASCII 文件名，避免中文文件名被上传工具剥掉。
+4. `v*` 标签触发 `.github/workflows/release.yml`，产出 Windows NSIS 安装包、便携版 exe、macOS Apple Silicon／Intel DMG，以及分平台的 `sha256sums-windows.txt`、`sha256sums-macos-*.txt` 和对应 MD5 文件。Release 资产使用 ASCII 文件名，避免中文文件名被上传工具剥掉。
 5. **构建结果由用户自行查看确认**。助手不要通过 GitHub API、gh CLI、轮询或日志下载查询 Actions 状态；推完标签即停下，等用户主动告知结果。
 6. 用户确认成功后，新建 `release-notes-X.Y.Z.md`，更新 Release 说明：
 
@@ -93,6 +94,7 @@ git push origin main
 ## 签名与发布注意事项
 
 - Windows 代码签名为可选项。配置仓库 secrets `WINDOWS_CERT_PFX`（PFX 的 base64）和 `WINDOWS_CERT_PASSWORD` 后，CI 会注入 `signCommand` 并调用 `scripts/sign-windows.ps1`。
+- macOS 当前仅配置 Apple Silicon／Intel 构建，未签名、未公证；正式公开发布前需要另行配置 Apple Developer ID 签名、公证、staple 和真机验收。
 - 不要把证书、私钥或密码写入仓库、日志或 `tauri.conf.json`。
 - 当前主程序没有接入 updater，因此发布流程**不生成 `latest.json`，也不需要 Tauri updater 私钥**。以后接入自动更新时再单独设计签名密钥和更新清单，不能直接复用速启的仓库地址。
 - 发布资源必须由 `scripts/prepare-bundled-plugins.mjs` 生成，避免把插件依赖、构建缓存、日志和数据库打进安装包。
