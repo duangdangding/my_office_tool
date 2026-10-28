@@ -56,7 +56,12 @@ let updateDownloaded = 0;
 let updateTotal = 0;
 let pendingImportSession = "";
 
-const escape = (value: unknown) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
+// 仅在界面展示时移除 Windows 扩展路径前缀，保留数据模型中的原始路径。
+const displayText = (value: unknown) => String(value ?? "")
+  .split("\\\\?\\UNC\\").join("\\\\")
+  .split("\\\\?\\").join("");
+
+const escape = (value: unknown) => displayText(value).replace(/[&<>"']/g, (char) => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
 }[char]!));
 
@@ -432,9 +437,9 @@ async function showLog(id: string, errorMessage?: string): Promise<void> {
   const view = modalRoot.querySelector<HTMLElement>(".log-view");
   try {
     const log = await readPluginLog(id);
-    if (view) view.textContent = log;
+    if (view) view.textContent = displayText(log);
   } catch (error) {
-    if (view) view.textContent = `读取日志失败：${String(error)}`;
+    if (view) view.textContent = displayText(`读取日志失败：${String(error)}`);
   }
 }
 
