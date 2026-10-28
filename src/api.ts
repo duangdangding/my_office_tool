@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import suqiManifest from "../plugins/suqi/office-plugin.json";
 import lscopyManifest from "../plugins/lscopy/office-plugin.json";
-import type { AppSettings, ExtractPluginResult, PluginDirectoryView, PluginImportOutcome, PluginManifest, PluginRules, PluginView } from "./types";
+import type { AppSettings, AppTheme, ExtractPluginResult, PluginDirectoryView, PluginImportOutcome, PluginManifest, PluginRules, PluginView } from "./types";
 
 export const isDesktop = "__TAURI_INTERNALS__" in window;
 
@@ -40,6 +40,7 @@ export async function getPluginDirectory(): Promise<PluginDirectoryView> {
 const browserSettings: AppSettings = {
   launchAtStartup: false,
   silentStart: false,
+  theme: "light",
   pluginDir: { path: "F:\\workspace\\my\\vscode\\my_office_tool\\plugins", isDefault: false },
 };
 
@@ -56,6 +57,12 @@ export async function setLaunchAtStartup(enabled: boolean): Promise<AppSettings>
 export async function setSilentStart(enabled: boolean): Promise<AppSettings> {
   if (isDesktop) return invoke<AppSettings>("set_silent_start", { enabled });
   browserSettings.silentStart = enabled;
+  return clone(browserSettings);
+}
+
+export async function setTheme(theme: AppTheme): Promise<AppSettings> {
+  if (isDesktop) return invoke<AppSettings>("set_theme", { theme });
+  browserSettings.theme = theme;
   return clone(browserSettings);
 }
 

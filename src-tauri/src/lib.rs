@@ -235,6 +235,18 @@ struct PluginDirectoryView {
     is_default: bool,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+enum AppTheme {
+    #[default]
+    Light,
+    Dark,
+    Paper,
+    Forest,
+    Ocean,
+    Sunset,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct StoredSettings {
@@ -243,6 +255,8 @@ struct StoredSettings {
     launch_at_startup: bool,
     #[serde(default)]
     silent_start: bool,
+    #[serde(default)]
+    theme: AppTheme,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -250,6 +264,7 @@ struct StoredSettings {
 struct AppSettingsView {
     launch_at_startup: bool,
     silent_start: bool,
+    theme: AppTheme,
     plugin_dir: PluginDirectoryView,
 }
 
@@ -1065,6 +1080,7 @@ fn get_settings(state: State<'_, AppState>) -> AppSettingsView {
     AppSettingsView {
         launch_at_startup: settings.launch_at_startup,
         silent_start: settings.silent_start,
+        theme: settings.theme,
         plugin_dir: plugin_directory_view(&state),
     }
 }
@@ -1080,6 +1096,13 @@ fn set_launch_at_startup(state: State<'_, AppState>, enabled: bool) -> Result<Ap
 #[tauri::command]
 fn set_silent_start(state: State<'_, AppState>, enabled: bool) -> Result<AppSettingsView, String> {
     state.settings.lock().unwrap().silent_start = enabled;
+    save_settings(&state)?;
+    Ok(get_settings(state))
+}
+
+#[tauri::command]
+fn set_theme(state: State<'_, AppState>, theme: AppTheme) -> Result<AppSettingsView, String> {
+    state.settings.lock().unwrap().theme = theme;
     save_settings(&state)?;
     Ok(get_settings(state))
 }
@@ -1742,6 +1765,7 @@ pub fn run() {
             get_settings,
             set_launch_at_startup,
             set_silent_start,
+            set_theme,
             update_plugin,
             update_plugin_rules,
             launch_plugin,
@@ -2266,6 +2290,13 @@ mod tests {
     }
 
     #[test]
+    fn legacy_settings_use_light_theme() {
+        let settings: StoredSettings = serde_json::from_str("{}").unwrap();
+        assert!(matches!(settings.theme, AppTheme::Light));
+        assert!(matches!(StoredSettings::default().theme, AppTheme::Light));
+    }
+
+    #[test]
     fn custom_plugin_directory_is_persisted() {
         let base = test_dir("settings");
         let custom = base.join("custom-plugins");
@@ -2282,8 +2313,10 @@ mod tests {
         pending_imports: Mutex::new(HashMap::new()),
         };
 
+        state.settings.lock().unwrap().theme = AppTheme::Ocean;
         save_plugin_dir(&state, &custom).unwrap();
         assert_eq!(load_plugin_dir(&base), custom);
+        assert!(matches!(load_settings(&base).theme, AppTheme::Ocean));
         let _ = fs::remove_dir_all(base);
     }
 

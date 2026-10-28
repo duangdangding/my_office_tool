@@ -21,10 +21,11 @@ import {
   setLaunchAtStartup,
   setPluginDirectory,
   setSilentStart,
+  setTheme,
   stopPlugin,
   updatePlugin,
 } from "./api";
-import type { AppSettings, PluginImportOutcome, PluginManifest, PluginRules, PluginStatus, PluginView } from "./types";
+import type { AppSettings, AppTheme, PluginImportOutcome, PluginManifest, PluginRules, PluginStatus, PluginView } from "./types";
 import type { Update } from "@tauri-apps/plugin-updater";
 import {
   checkAppUpdate,
@@ -55,6 +56,22 @@ let pendingAppUpdate: Update | null = null;
 let updateDownloaded = 0;
 let updateTotal = 0;
 let pendingImportSession = "";
+
+const themes: Array<{ id: AppTheme; label: string; description: string; background: string; accent: string; sidebar: string }> = [
+  { id: "light", label: "浅色", description: "清爽自然", background: "#f6f7f5", accent: "#19785c", sidebar: "#16241f" },
+  { id: "dark", label: "深色", description: "低光舒适", background: "#101613", accent: "#72cda4", sidebar: "#0c120f" },
+  { id: "paper", label: "纸张", description: "温暖柔和", background: "#f4efe7", accent: "#966737", sidebar: "#29241f" },
+  { id: "forest", label: "森林", description: "沉静绿意", background: "#edf3ee", accent: "#357457", sidebar: "#14291e" },
+  { id: "ocean", label: "海洋", description: "清澈专注", background: "#edf3f8", accent: "#357ba5", sidebar: "#152838" },
+  { id: "sunset", label: "落日", description: "暖橙活力", background: "#faf0ec", accent: "#b35f4c", sidebar: "#2c1e1d" },
+];
+
+function applyTheme(theme: AppTheme): void {
+  document.documentElement.dataset.theme = theme;
+  document.documentElement.style.colorScheme = theme === "dark" ? "dark" : "light";
+  const sidebar = themes.find((item) => item.id === theme)?.sidebar ?? themes[0].sidebar;
+  document.querySelector<HTMLMetaElement>('meta[name="theme-color"]')?.setAttribute("content", sidebar);
+}
 
 // 仅在界面展示时移除 Windows 扩展路径前缀，保留数据模型中的原始路径。
 const displayText = (value: unknown) => String(value ?? "")
@@ -204,9 +221,10 @@ function settingToggle(key: "launchAtStartup" | "silentStart", title: string, de
 
 function settingsContent(): string {
   if (!settings) {
-    return `<section class="page-heading compact"><div><p class="eyebrow">PREFERENCES</p><h1>设置</h1><p>管理工具箱的启动行为和插件存放位置。</p></div></section><div class="loading-state"><span class="spinner dark"></span><p>正在读取设置…</p></div>`;
+    return `<section class="page-heading compact"><div><p class="eyebrow">PREFERENCES</p><h1>设置</h1><p>管理工具箱的外观、启动行为和插件存放位置。</p></div></section><div class="loading-state"><span class="spinner dark"></span><p>正在读取设置…</p></div>`;
   }
-  return `<section class="page-heading compact"><div><p class="eyebrow">PREFERENCES</p><h1>设置</h1><p>管理工具箱的启动行为和插件存放位置。</p></div></section>
+  return `<section class="page-heading compact"><div><p class="eyebrow">PREFERENCES</p><h1>设置</h1><p>管理工具箱的外观、启动行为和插件存放位置。</p></div></section>
+    <section class="spec-card settings-card"><div><span class="section-kicker">APPEARANCE</span><h2>外观主题</h2><p class="settings-description">选择喜欢的配色，切换立即生效，下次启动会继续使用。</p></div><div class="theme-grid">${themes.map((theme) => { const selected = settings?.theme === theme.id; return `<button type="button" class="theme-option ${selected ? "active" : ""}" data-action="theme" data-theme="${theme.id}" aria-pressed="${selected}" ${settingsBusy === "theme" ? "disabled" : ""}><span class="theme-swatch" style="--swatch-bg:${theme.background};--swatch-accent:${theme.accent};--swatch-sidebar:${theme.sidebar}"><i></i><i></i></span><span class="theme-copy"><b>${theme.label}</b><small>${theme.description}</small></span>${selected ? `<span class="theme-check">${icon("check", 15)}</span>` : ""}</button>`; }).join("")}</div></section>
     <section class="spec-card settings-card"><div><span class="section-kicker">STARTUP</span><h2>启动</h2></div><div class="form-section settings-form">${settingToggle("launchAtStartup", "开机启动", "登录系统后自动启动办公工具箱，更改会立即写入系统启动项。", settings.launchAtStartup)}${settingToggle("silentStart", "静默启动", "下次启动时不显示主窗口，只驻留系统托盘；可从托盘菜单打开窗口。", settings.silentStart)}</div></section>
     <section class="spec-card settings-card"><div><span class="section-kicker">STORAGE</span><h2>插件目录</h2><p class="settings-description">每次启动都会扫描此目录，新导入的插件也复制到这里。切换目录不会迁移或删除旧文件，规则配置会保留。</p></div><div class="settings-directory"><div><b>${settings.pluginDir.isDefault ? "默认目录" : "自定义目录"}</b><code>${escape(settings.pluginDir.path)}</code></div><button class="button subtle" data-action="plugin-directory">${icon("folder", 16)}更改目录</button></div></section>`;
 }
@@ -469,6 +487,27 @@ async function runPlugin(id: string, detached?: boolean): Promise<void> {
   }
 }
 
+async function selectTheme(theme: AppTheme): Promise<void> {
+  if (!settings || settingsBusy || settings.theme === theme) return;
+  const previous = settings.theme;
+  settingsBusy = "theme";
+  settings = { ...settings, theme };
+  applyTheme(theme);
+  render();
+  try {
+    settings = await setTheme(theme);
+    applyTheme(settings.theme);
+    toast(`已切换为${themes.find((item) => item.id === theme)?.label ?? ""}主题。`, "success");
+  } catch (error) {
+    applyTheme(previous);
+    if (settings) settings = { ...settings, theme: previous };
+    toast(String(error), "error");
+  } finally {
+    settingsBusy = "";
+    render();
+  }
+}
+
 function permissionLabel(permission: string): string {
   return ({ clipboard: "剪贴板", network: "网络", globalShortcut: "快捷键", fileSystem: "文件", autostart: "自启动", process: "进程" } as Record<string, string>)[permission] ?? permission;
 }
@@ -482,6 +521,10 @@ document.addEventListener("click", (event) => {
     currentView = (target.dataset.view ?? "all") as ViewKey;
     render();
   } else if (action === "plugin-directory") void showPluginDirectory();
+  else if (action === "theme") {
+    const theme = themes.find((item) => item.id === target.dataset.theme);
+    if (theme) void selectTheme(theme.id);
+  }
   else if (action === "app-check-update") void runAppUpdateCheck();
   else if (action === "app-install-update") void runAppUpdateInstall();
   else if (action === "app-open-releases") void openReleasePage().catch((error) => toast(String(error), "error"));
@@ -733,6 +776,7 @@ document.addEventListener("keydown", (event) => {
 void refresh();
 void getSettings().then((value) => {
   settings = value;
+  applyTheme(value.theme);
   if (currentView === "settings") render();
 }).catch((error) => toast(`读取设置失败：${String(error)}`, "error"));
 void Promise.all([getAppVersion(), getInstallKind()]).then(([version, kind]) => {
