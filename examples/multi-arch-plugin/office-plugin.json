@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "id": "multi-arch-plugin",
+  "name": "多架构示例插件",
+  "version": "0.1.0",
+  "description": "验证工具箱按操作系统和 CPU 架构选择独立进程入口。",
+  "author": "Office Toolbox",
+  "category": "开发示例",
+  "icon": "puzzle",
+  "permissions": [],
+  "platforms": ["windows", "macos"],
+  "entry": {
+    "mode": "executable",
+    "executable": [
+      {
+        "path": "target/x86_64-pc-windows-msvc/release/multi-arch-plugin.exe",
+        "platforms": ["windows"],
+        "architectures": ["x86_64"]
+      },
+      {
+        "path": "target/aarch64-apple-darwin/release/multi-arch-plugin",
+        "platforms": ["macos"],
+        "architectures": ["aarch64"]
+      },
+      {
+        "path": "target/x86_64-apple-darwin/release/multi-arch-plugin",
+        "platforms": ["macos"],
+        "architectures": ["x86_64"]
+      }
+    ]
+  },
+  "standalone": {
+    "instructions": "安装 Rust 后，在插件目录执行 cargo run；发布时按目标平台执行 cargo build --release --target <目标三元组>。"
+  }
+}

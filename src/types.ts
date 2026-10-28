@@ -12,6 +12,12 @@ export interface PluginRules {
   allowPluginAutostart: boolean;
 }
 
+export type PluginExecutable = string | {
+  path: string;
+  platforms?: Array<"windows" | "macos">;
+  architectures?: Array<"x86_64" | "aarch64">;
+};
+
 export interface PluginManifest {
   schemaVersion: number;
   id: string;
@@ -25,7 +31,7 @@ export interface PluginManifest {
   platforms?: Array<"windows" | "macos">;
   entry: {
     mode: "auto" | "executable" | "dev";
-    executable: string[];
+    executable: PluginExecutable[];
     dev?: { program: string; args: string[]; cwd: string };
   };
   standalone: { instructions: string };
@@ -60,6 +66,19 @@ export interface PluginView {
     detail: string | null;
   };
 }
+
+export type PluginImportOutcome = {
+  status: "imported";
+  plugin: PluginView;
+} | {
+  status: "needsManifest";
+  sessionId: string;
+  source: string;
+  draft: PluginManifest;
+  executableCandidates: string[];
+  platform: "windows" | "macos";
+  architecture: "x86_64" | "aarch64";
+};
 
 export interface ExtractPluginResult {
   outputDir: string;

@@ -1,8 +1,10 @@
 import "./styles.css";
 import {
+  cancelPluginImport,
   chooseExtractDirectory,
   choosePluginDirectory,
   choosePluginStorageDirectory,
+  completePluginImport,
   extractPlugin,
   getPluginDirectory,
   getSettings,
@@ -22,7 +24,7 @@ import {
   stopPlugin,
   updatePlugin,
 } from "./api";
-import type { AppSettings, PluginRules, PluginStatus, PluginView } from "./types";
+import type { AppSettings, PluginImportOutcome, PluginManifest, PluginRules, PluginStatus, PluginView } from "./types";
 import type { Update } from "@tauri-apps/plugin-updater";
 import {
   checkAppUpdate,
@@ -52,6 +54,7 @@ let updateMessage = "尚未检查更新";
 let pendingAppUpdate: Update | null = null;
 let updateDownloaded = 0;
 let updateTotal = 0;
+let pendingImportSession = "";
 
 const escape = (value: unknown) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
@@ -291,8 +294,8 @@ function aboutContent(): string {
   return `<section class="page-heading compact"><div><p class="eyebrow">OPEN & INDEPENDENT</p><h1>一个开放的小型办公生态</h1><p>工具箱不接管插件的窗口与数据，只提供统一的入口和运行规则。</p></div></section>
     ${appUpdateCard()}
     <section class="architecture-card"><div class="architecture-copy"><span class="section-kicker">运行架构</span><h2>相互独立，才能稳定协作</h2><p>每个工具都是独立进程。一个插件崩溃不会拖垮工具箱；插件也可以脱离本体，使用原来的方式开发、构建和运行。</p><div class="architecture-points"><span>${icon("check", 16)}标准 JSON 清单</span><span>${icon("check", 16)}独立数据目录</span><span>${icon("check", 16)}托管 / 独立双模式</span></div></div><div class="architecture-diagram"><div class="host-node">${icon("grid", 23)}<b>办公工具箱</b><small>规则 · 启停 · 日志</small></div><div class="diagram-lines"><i></i><i></i></div><div class="child-nodes"><span>${icon("rocket", 20)}速启</span><span>${icon("clipboard", 20)}共享剪贴板</span><span>${icon("puzzle", 20)}你的插件</span></div></div></section>
-    <section class="spec-card management-card"><div><span class="section-kicker">PLUGIN MANAGEMENT</span><h2>从导入到更新，统一管理</h2></div><div class="management-grid"><div>${icon("folder", 19)}<b>自定义插件目录</b><p>在「设置」中选择存放位置。每次启动自动扫描，后续导入也写入此目录；切换时不迁移旧文件。</p></div><div>${icon("shield", 19)}<b>导入兼容性检查</b><p>支持本地目录、ZIP 压缩包和 Git 仓库；压缩包导入无需安装 Git。导入前检查清单规范、当前平台及启动方式。</p></div><div>${icon("activity", 19)}<b>来源更新</b><p>本地插件从原项目重新同步，Git 与压缩包插件从远程来源获取最新内容。校验通过后替换，失败时保留旧版本。</p></div><div>${icon("box", 19)}<b>删除与产物提取</b><p>删除时可选是否同时删除原始本地项目；编译产物可提取到指定目录，并保留相对路径。</p></div></div></section>
-    <section class="spec-card"><div><span class="section-kicker">PLUGIN MANIFEST V1</span><h2>三步接入你的插件</h2></div><ol class="spec-steps"><li><span>01</span><div><b>添加插件清单</b><p>在插件根目录创建 <code>office-plugin.json</code>，声明 id、名称、版本和启动命令；可选 <code>platforms</code> 声明 windows／macos。</p></div></li><li><span>02</span><div><b>声明启动方式</b><p><code>executable</code> 指向已构建程序；<code>dev</code> 声明开发命令；<code>auto</code> 优先程序、回退开发命令。</p></div></li><li><span>03</span><div><b>读取规则并报告就绪</b><p>读取 <code>OFFICE_PLUGIN_RULES_FILE</code> 和 <code>OFFICE_PLUGIN_ALLOW_*</code>；初始化完成后输出 <code>OFFICE_TOOLBOX_READY:插件id</code>。</p></div></li></ol><div class="env-example"><code>OFFICE_PLUGIN_ID=suqi</code><code>OFFICE_PLUGIN_ALLOW_NETWORK=true</code><code>OFFICE_PLUGIN_ALLOW_CLIPBOARD=true</code><code>OFFICE_PLUGIN_DATA_DIR=…</code></div></section>`;
+    <section class="spec-card management-card"><div><span class="section-kicker">PLUGIN MANAGEMENT</span><h2>从导入到更新，统一管理</h2></div><div class="management-grid"><div>${icon("folder", 19)}<b>自定义插件目录</b><p>在「设置」中选择存放位置。每次启动自动扫描，后续导入也写入此目录；切换时不迁移旧文件。</p></div><div>${icon("shield", 19)}<b>导入兼容性检查</b><p>支持本地目录、ZIP 压缩包和 Git 仓库；缺少 office-plugin.json 时可扫描并生成。导入前检查清单规范、当前平台及启动方式。</p></div><div>${icon("activity", 19)}<b>来源更新</b><p>本地插件从原项目重新同步，Git 与压缩包插件从远程来源获取最新内容。校验通过后替换，失败时保留旧版本。</p></div><div>${icon("box", 19)}<b>删除与产物提取</b><p>删除时可选是否同时删除原始本地项目；编译产物可提取到指定目录，并保留相对路径。</p></div></div></section>
+    <section class="spec-card"><div><span class="section-kicker">PLUGIN MANIFEST V1</span><h2>三步接入你的插件</h2></div><ol class="spec-steps"><li><span>01</span><div><b>添加插件清单</b><p>在插件根目录创建 <code>office-plugin.json</code>，声明 id、名称、版本和启动命令；可选 <code>platforms</code> 声明 windows／macos。</p></div></li><li><span>02</span><div><b>声明启动方式</b><p><code>executable</code> 指向已构建程序；多架构时可使用包含 <code>path</code>、<code>platforms</code>、<code>architectures</code>（x86_64／aarch64）的对象，启动时自动匹配；<code>dev</code> 声明开发命令；<code>auto</code> 优先程序、回退开发命令。</p></div></li><li><span>03</span><div><b>读取规则并报告就绪</b><p>读取 <code>OFFICE_PLUGIN_RULES_FILE</code> 和 <code>OFFICE_PLUGIN_ALLOW_*</code>；初始化完成后输出 <code>OFFICE_TOOLBOX_READY:插件id</code>。</p></div></li></ol><div class="env-example"><code>OFFICE_PLUGIN_ID=suqi</code><code>OFFICE_PLUGIN_ALLOW_NETWORK=true</code><code>OFFICE_PLUGIN_ALLOW_CLIPBOARD=true</code><code>OFFICE_PLUGIN_DATA_DIR=…</code></div></section>`;
 }
 
 const viewTitles: Record<ViewKey, [string, string]> = {
@@ -328,7 +331,10 @@ async function refresh(): Promise<void> {
 }
 
 function closeModal(): void {
+  const sessionId = pendingImportSession;
+  pendingImportSession = "";
   modalRoot.innerHTML = "";
+  if (sessionId) void cancelPluginImport(sessionId).catch((error) => toast(`清理导入临时文件失败：${String(error)}`, "error"));
 }
 
 function showModal(content: string, className = ""): void {
@@ -337,18 +343,42 @@ function showModal(content: string, className = ""): void {
 
 function showImport(mode: "local" | "git" | "archive" = "local"): void {
   showModal(`<button class="modal-close" data-action="close-modal" aria-label="关闭">${icon("close")}</button><span class="modal-symbol">${icon("plus", 26)}</span><h2>导入插件</h2><div class="import-source-tabs"><button class="${mode === "local" ? "active" : ""}" data-action="import-mode" data-mode="local">${icon("folder", 16)}本地项目</button><button class="${mode === "archive" ? "active" : ""}" data-action="import-mode" data-mode="archive">${icon("box", 16)}压缩包（免 Git）</button><button class="${mode === "git" ? "active" : ""}" data-action="import-mode" data-mode="git">${icon("terminal", 16)}Git 项目</button></div>
-    ${mode === "local" ? `<p class="modal-intro">选择包含 <code>office-plugin.json</code> 的文件夹。插件会复制到工具箱，原目录保持不变；清单中已有的编译程序也会一并复制。</p><div class="modal-actions"><button class="button subtle" data-action="close-modal">取消</button><button class="button primary" data-action="confirm-import">选择插件文件夹${icon("arrow", 16)}</button></div>` : mode === "archive" ? `<form id="archive-import-form"><p class="modal-intro">输入 ZIP 下载地址或 GitHub 仓库地址，工具箱会直接下载并解压，<b>无需安装 Git</b>。GitHub 仓库使用默认分支；包含 Git 子模块的插件请改用 Git 导入。</p><label class="field-label" for="archive-repository">压缩包或仓库地址</label><input class="text-input" id="archive-repository" name="repository" type="text" placeholder="https://github.com/owner/plugin 或 https://…/plugin.zip" autocomplete="off" required autofocus/><div class="modal-actions"><button type="button" class="button subtle" data-action="close-modal">取消</button><button class="button primary" type="submit">下载并导入${icon("arrow", 16)}</button></div></form>` : `<form id="git-import-form"><p class="modal-intro">输入 Git 仓库地址，工具箱会克隆默认分支及其子模块。仓库根目录必须包含 <code>office-plugin.json</code>，本机需已安装 Git。</p><label class="field-label" for="git-repository">仓库地址</label><input class="text-input" id="git-repository" name="repository" type="text" placeholder="https://github.com/owner/plugin.git" autocomplete="off" required autofocus/><div class="modal-actions"><button type="button" class="button subtle" data-action="close-modal">取消</button><button class="button primary" type="submit">克隆并导入${icon("arrow", 16)}</button></div></form>`}
+    ${mode === "local" ? `<p class="modal-intro">选择插件文件夹。插件会复制到工具箱，原目录保持不变；没有 <code>office-plugin.json</code> 时，可以扫描并生成。</p><div class="modal-actions"><button class="button subtle" data-action="close-modal">取消</button><button class="button primary" data-action="confirm-import">选择插件文件夹${icon("arrow", 16)}</button></div>` : mode === "archive" ? `<form id="archive-import-form"><p class="modal-intro">输入 ZIP 下载地址或 GitHub 仓库地址，工具箱会直接下载并解压，<b>无需安装 Git</b>。没有清单时可在下载后补全。</p><label class="field-label" for="archive-repository">压缩包或仓库地址</label><input class="text-input" id="archive-repository" name="repository" type="text" placeholder="https://github.com/owner/plugin 或 https://…/plugin.zip" autocomplete="off" required autofocus/><div class="modal-actions"><button type="button" class="button subtle" data-action="close-modal">取消</button><button class="button primary" type="submit">下载并导入${icon("arrow", 16)}</button></div></form>` : `<form id="git-import-form"><p class="modal-intro">输入 Git 仓库地址，工具箱会克隆默认分支及其子模块，本机需已安装 Git。没有清单时可在克隆后补全。</p><label class="field-label" for="git-repository">仓库地址</label><input class="text-input" id="git-repository" name="repository" type="text" placeholder="https://github.com/owner/plugin.git" autocomplete="off" required autofocus/><div class="modal-actions"><button type="button" class="button subtle" data-action="close-modal">取消</button><button class="button primary" type="submit">克隆并导入${icon("arrow", 16)}</button></div></form>`}
     <div class="warning-box import-warning">${icon("shield", 20)}<p>导入前会检查清单规范、当前平台和启动方式，不兼容的插件不会写入插件目录。插件是可执行代码，请只导入信任的来源。</p></div>`, "import-modal");
 }
 
-async function performImport(importAction: () => Promise<PluginView>): Promise<void> {
+type ManifestImportRequest = Extract<PluginImportOutcome, { status: "needsManifest" }>;
+
+function showManifestWizard(request: ManifestImportRequest): void {
+  const { draft } = request;
+  const firstExecutable = draft.entry.executable[0];
+  const executablePath = typeof firstExecutable === "string" ? firstExecutable : firstExecutable?.path ?? "";
+  const dev = draft.entry.dev;
+  const candidates = request.executableCandidates.map((path) => `<option value="${escape(path)}"></option>`).join("");
+  showModal(`<button class="modal-close" data-action="close-modal" aria-label="关闭">${icon("close")}</button><span class="modal-symbol">${icon("puzzle", 25)}</span><h2>补全插件清单</h2><p class="modal-intro">没有找到 <code>office-plugin.json</code>。已生成默认配置，请确认启动方式；配置只写入工具箱中的导入副本。</p><div class="standalone-info import-source-info"><b>插件来源 · ${escape(request.platform)}/${escape(request.architecture)}</b><code>${escape(request.source)}</code></div><form id="manifest-import-form" data-session="${escape(request.sessionId)}" data-platform="${request.platform}" data-architecture="${request.architecture}">
+    <div class="manifest-form-grid"><label><span class="field-label">插件名称</span><input class="text-input" name="name" value="${escape(draft.name)}" required/></label><label><span class="field-label">插件 ID</span><input class="text-input" name="id" value="${escape(draft.id)}" pattern="[a-z0-9_-]+" maxlength="64" required/></label><label><span class="field-label">版本</span><input class="text-input" name="version" value="${escape(draft.version)}" required/></label><label><span class="field-label">启动模式</span><select class="text-input" name="mode"><option value="auto" ${draft.entry.mode === "auto" ? "selected" : ""}>自动：程序优先，开发命令回退</option><option value="executable" ${draft.entry.mode === "executable" ? "selected" : ""}>已编译程序</option><option value="dev" ${draft.entry.mode === "dev" ? "selected" : ""}>开发命令</option></select></label></div>
+    <label class="manifest-description"><span class="field-label">描述</span><input class="text-input" name="description" value="${escape(draft.description)}"/></label>
+    <div class="form-section manifest-entry-section"><h3>已编译程序 <span>相对插件目录</span></h3><input class="text-input" name="executable" value="${escape(executablePath)}" list="executable-candidates" placeholder="例如 target/release/tool.exe"/><datalist id="executable-candidates">${candidates}</datalist><p class="form-hint">${request.executableCandidates.length ? `扫描到 ${request.executableCandidates.length} 个候选程序，可从下拉建议中选择或手动修改。` : "未扫描到当前平台的可执行程序，请手动填写路径或改用开发命令。"}</p></div>
+    <div class="form-section manifest-entry-section"><h3>开发命令 <span>自动模式可选</span></h3><div class="manifest-form-grid dev-command-grid"><label><span class="field-label">程序</span><input class="text-input" name="devProgram" value="${escape(dev?.program ?? "")}" placeholder="npm、cargo、python"/></label><label><span class="field-label">工作目录</span><input class="text-input" name="devCwd" value="${escape(dev?.cwd ?? ".")}" required/></label></div><label class="manifest-description"><span class="field-label">参数</span><input class="text-input" name="devArgs" value="${escape(dev?.args.join(" ") ?? "")}" placeholder="run dev"/></label></div>
+    <div class="modal-actions"><button type="button" class="button subtle" data-action="close-modal">取消</button><button class="button primary" type="submit">生成清单并导入${icon("arrow", 16)}</button></div>
+  </form>`, "rules-modal");
+}
+
+async function performImport(importAction: () => Promise<PluginImportOutcome>): Promise<void> {
   closeModal();
   loading = true;
   render();
   try {
-    const plugin = await importAction();
+    const outcome = await importAction();
+    if (outcome.status === "needsManifest") {
+      loading = false;
+      render();
+      pendingImportSession = outcome.sessionId;
+      showManifestWizard(outcome);
+      return;
+    }
     await refresh();
-    toast(`已导入「${plugin.manifest.name}」。`, "success");
+    toast(`已导入「${outcome.plugin.manifest.name}」。`, "success");
   } catch (error) {
     loading = false;
     render();
@@ -359,7 +389,7 @@ async function performImport(importAction: () => Promise<PluginView>): Promise<v
 function showExtract(id: string): void {
   const plugin = plugins.find((item) => item.manifest.id === id);
   if (!plugin) return;
-  showModal(`<button class="modal-close" data-action="close-modal">${icon("close")}</button><span class="modal-symbol">${icon("box", 25)}</span><h2>提取「${escape(plugin.manifest.name)}」编译产物</h2><p class="modal-intro">将清单 <code>entry.executable</code> 中已存在的程序复制到所选目录，并保留相对路径。此操作只提取，不会执行编译。</p><div class="artifact-list">${plugin.manifest.entry.executable.map((file) => `<code>${escape(file)}</code>`).join("")}</div><div class="modal-actions"><button class="button subtle" data-action="close-modal">取消</button><button class="button primary" data-action="confirm-extract" data-id="${id}">选择目录并提取${icon("arrow", 16)}</button></div>`);
+  showModal(`<button class="modal-close" data-action="close-modal">${icon("close")}</button><span class="modal-symbol">${icon("box", 25)}</span><h2>提取「${escape(plugin.manifest.name)}」编译产物</h2><p class="modal-intro">将清单 <code>entry.executable</code> 中已存在的程序复制到所选目录，并保留相对路径。此操作只提取，不会执行编译。</p><div class="artifact-list">${plugin.manifest.entry.executable.map((file) => `<code>${escape(typeof file === "string" ? file : file.path)}</code>`).join("")}</div><div class="modal-actions"><button class="button subtle" data-action="close-modal">取消</button><button class="button primary" data-action="confirm-extract" data-id="${id}">选择目录并提取${icon("arrow", 16)}</button></div>`);
 }
 
 async function showPluginDirectory(): Promise<void> {
@@ -601,6 +631,64 @@ document.addEventListener("submit", (event) => {
       return;
     }
     void performImport(() => importArchivePlugin(url));
+    return;
+  }
+  if (form.id === "manifest-import-form") {
+    event.preventDefault();
+    const field = (name: string) => form.querySelector<HTMLInputElement | HTMLSelectElement>(`[name="${name}"]`)?.value.trim() ?? "";
+    const sessionId = form.dataset.session ?? "";
+    const platform = form.dataset.platform === "macos" ? "macos" : "windows";
+    const architecture = form.dataset.architecture === "aarch64" ? "aarch64" : "x86_64";
+    const mode = field("mode") as PluginManifest["entry"]["mode"];
+    const executablePath = field("executable");
+    const devProgram = field("devProgram");
+    if (mode !== "dev" && !executablePath) {
+      toast("请填写已编译程序路径，或改用开发命令模式。", "error");
+      return;
+    }
+    if (mode !== "executable" && !devProgram) {
+      toast("请填写开发启动程序。", "error");
+      return;
+    }
+    const devArgs = (field("devArgs").match(/"[^"]*"|'[^']*'|\S+/g) ?? []).map((argument) => argument.replace(/^["']|["']$/g, ""));
+    const manifest: PluginManifest = {
+      schemaVersion: 1,
+      id: field("id"),
+      name: field("name"),
+      version: field("version"),
+      description: field("description"),
+      author: "",
+      category: "办公效率",
+      icon: "puzzle",
+      permissions: [],
+      platforms: [platform],
+      entry: {
+        mode,
+        executable: executablePath ? [{ path: executablePath, platforms: [platform], architectures: [architecture] }] : [],
+        dev: devProgram ? { program: devProgram, args: devArgs, cwd: field("devCwd") || "." } : undefined,
+      },
+      standalone: { instructions: "由办公工具箱按照生成的 office-plugin.json 启动。" },
+    };
+    const submit = form.querySelector<HTMLButtonElement>('button[type="submit"]');
+    if (submit) {
+      submit.disabled = true;
+      submit.textContent = "正在生成并导入…";
+    }
+    void (async () => {
+      try {
+        const plugin = await completePluginImport(sessionId, manifest);
+        pendingImportSession = "";
+        closeModal();
+        await refresh();
+        toast(`已生成清单并导入「${plugin.manifest.name}」。`, "success");
+      } catch (error) {
+        toast(String(error), "error");
+        if (submit) {
+          submit.disabled = false;
+          submit.textContent = "生成清单并导入";
+        }
+      }
+    })();
     return;
   }
   if (form.id !== "rules-form") return;

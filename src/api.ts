@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import suqiManifest from "../plugins/suqi/office-plugin.json";
 import lscopyManifest from "../plugins/lscopy/office-plugin.json";
-import type { AppSettings, ExtractPluginResult, PluginDirectoryView, PluginManifest, PluginRules, PluginView } from "./types";
+import type { AppSettings, ExtractPluginResult, PluginDirectoryView, PluginImportOutcome, PluginManifest, PluginRules, PluginView } from "./types";
 
 export const isDesktop = "__TAURI_INTERNALS__" in window;
 
@@ -72,7 +72,7 @@ export async function setPluginDirectory(path: string): Promise<PluginDirectoryV
 
 export async function choosePluginDirectory(): Promise<string | null> {
   if (!isDesktop) return null;
-  const selected = await open({ directory: true, multiple: false, title: "选择包含 office-plugin.json 的插件目录" });
+  const selected = await open({ directory: true, multiple: false, title: "选择插件目录" });
   return typeof selected === "string" ? selected : null;
 }
 
@@ -82,19 +82,29 @@ export async function chooseExtractDirectory(): Promise<string | null> {
   return typeof selected === "string" ? selected : null;
 }
 
-export async function importPlugin(path: string): Promise<PluginView> {
+export async function importPlugin(path: string): Promise<PluginImportOutcome> {
   if (!isDesktop) throw new Error("浏览器预览不执行本地导入，请在桌面应用中使用此功能。");
-  return invoke<PluginView>("import_plugin", { path });
+  return invoke<PluginImportOutcome>("import_plugin", { path });
 }
 
-export async function importGitPlugin(url: string): Promise<PluginView> {
+export async function importGitPlugin(url: string): Promise<PluginImportOutcome> {
   if (!isDesktop) throw new Error("浏览器预览不执行 Git 导入，请在桌面应用中使用此功能。");
-  return invoke<PluginView>("import_git_plugin", { url });
+  return invoke<PluginImportOutcome>("import_git_plugin", { url });
 }
 
-export async function importArchivePlugin(url: string): Promise<PluginView> {
+export async function importArchivePlugin(url: string): Promise<PluginImportOutcome> {
   if (!isDesktop) throw new Error("浏览器预览不执行压缩包导入，请在桌面应用中使用此功能。");
-  return invoke<PluginView>("import_archive_plugin", { url });
+  return invoke<PluginImportOutcome>("import_archive_plugin", { url });
+}
+
+export async function completePluginImport(sessionId: string, manifest: PluginManifest): Promise<PluginView> {
+  if (!isDesktop) throw new Error("浏览器预览不执行本地导入，请在桌面应用中使用此功能。");
+  return invoke<PluginView>("complete_plugin_import", { sessionId, manifest });
+}
+
+export async function cancelPluginImport(sessionId: string): Promise<void> {
+  if (!isDesktop) return;
+  await invoke("cancel_plugin_import", { sessionId });
 }
 
 export async function updatePlugin(id: string): Promise<PluginView> {
