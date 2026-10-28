@@ -82,7 +82,7 @@ jobs:
           target_args=()
           if [ -n "$target" ]; then target_args=(--target "$target"); fi
           for plugin in suqi lscopy; do
-            (cd "plugins/$plugin" && bun install --frozen-lockfile && bun run tauri build -- --no-bundle "${target_args[@]}")
+            (cd "plugins/$plugin" && bun install --frozen-lockfile && bun run tauri build --no-bundle "${target_args[@]}")
             release_dir="plugins/$plugin/src-tauri/target"
             if [ -n "$target" ]; then release_dir="$release_dir/$target"; fi
             binary="$release_dir/release/$plugin"
