@@ -5,6 +5,8 @@ import { fileURLToPath } from "node:url";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const source = join(root, "plugins");
 const target = join(root, ".generated", "plugins");
+// CI 可将预编译程序按插件内的相对路径暂存到这里；每次重新生成源码资源时自动合并。
+const prebuilt = join(root, ".generated", "plugin-binaries");
 const ignoredDirectories = new Set([".git", "node_modules", "target", "dist", "build", ".next", "__pycache__", ".generated"]);
 
 // 保留发布根目录，避免 Windows 删除后立即重建时出现短暂 EPERM。
@@ -23,5 +25,10 @@ for (const entry of readdirSync(source, { withFileTypes: true })) {
       return true;
     },
   });
+  const prebuiltPlugin = join(prebuilt, entry.name);
+  if (existsSync(prebuiltPlugin)) {
+    cpSync(prebuiltPlugin, join(target, entry.name), { recursive: true });
+    console.log(`已合并预编译插件：${entry.name}`);
+  }
   console.log(`已整理发布插件：${entry.name}`);
 }

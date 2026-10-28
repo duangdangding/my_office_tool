@@ -44,6 +44,12 @@ jobs:
           node-version: 22
           cache: npm
 
+      # macOS 内置插件随包提供预编译程序，最终用户无需安装 Bun / Rust。
+      - uses: oven-sh/setup-bun@v2
+        if: startsWith(matrix.id, 'mac')
+        with:
+          bun-version: latest
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
@@ -66,6 +72,32 @@ jobs:
           node scripts/prepare-bundled-plugins.mjs
           cargo test --manifest-path src-tauri/Cargo.toml
           cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
+
+      - name: Build bundled plugins for macOS
+        if: startsWith(matrix.id, 'mac')
+        shell: bash
+        run: |
+          set -eo pipefail
+          target="${{ matrix.target }}"
+          target_args=()
+          if [ -n "$target" ]; then target_args=(--target "$target"); fi
+          for plugin in suqi lscopy; do
+            (cd "plugins/$plugin" && bun install --frozen-lockfile && bun run tauri build -- --no-bundle "${target_args[@]}")
+            release_dir="plugins/$plugin/src-tauri/target"
+            if [ -n "$target" ]; then release_dir="$release_dir/$target"; fi
+            binary="$release_dir/release/$plugin"
+            [ -x "$binary" ] || { echo "未找到已编译插件：$binary"; exit 1; }
+            destination=".generated/plugin-binaries/$plugin/src-tauri/target/release"
+            mkdir -p "$destination"
+            cp "$binary" "$destination/$plugin"
+            chmod +x "$destination/$plugin"
+          done
+          # 主程序的 beforeBuildCommand 会再次执行此脚本，预编译目录必须独立于生成目录。
+          node scripts/prepare-bundled-plugins.mjs
+          for plugin in suqi lscopy; do
+            binary=".generated/plugins/$plugin/src-tauri/target/release/$plugin"
+            [ -x "$binary" ] || { echo "预编译插件未合并到发布资源：$binary"; exit 1; }
+          done
 
       # Windows 代码签名：配置证书 secrets 后自动启用。
       - name: Prepare Windows code signing

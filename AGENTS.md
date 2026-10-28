@@ -101,7 +101,7 @@ git push origin main
 - Windows 代码签名为可选项。配置仓库 secrets `WINDOWS_CERT_PFX`（PFX 的 base64）和 `WINDOWS_CERT_PASSWORD` 后，CI 会注入 `signCommand` 并调用 `scripts/sign-windows.ps1`；它与 updater 签名不是同一套密钥。
 - macOS 当前仅配置 Apple Silicon／Intel 构建，未签名、未公证；正式公开发布前需要另行配置 Apple Developer ID 签名、公证、staple 和真机验收。minisign 不等于 Apple 签名或公证。
 - 不要把证书、私钥或密码写入仓库、日志或 `tauri.conf.json`，也不要在回复或终端输出私钥和密码。
-- 发布资源必须由 `scripts/prepare-bundled-plugins.mjs` 生成，避免把插件依赖、构建缓存、日志和数据库打进安装包。
-- 当前随包的是插件源码；插件已有可执行文件时优先运行，否则回退到开发命令并需要对应 Bun／Rust 环境。若要求最终用户零开发环境运行，需要另行实现插件预编译产物打包。
+- 发布资源必须由 `scripts/prepare-bundled-plugins.mjs` 生成，避免把插件依赖、构建缓存、日志和数据库打进安装包；CI 暂存在 `.generated/plugin-binaries/` 的预编译程序由该脚本自动合并。
+- macOS Release 会先编译两个内置插件并随包可执行文件，最终用户无需 Bun／Rust；Windows 当前仍随包源码，已有可执行文件时优先运行，否则回退到开发命令并需要对应环境。
 - GitHub 推送默认直连。直连失败时只可临时使用明确指定的代理命令，不要把本机代理写回全局 Git 配置。
 - 插件开发若遇到 Bun shim 问题，确认 `where bun` 第一条指向真实 `bun.exe`，不要通过修改项目代码绕过环境问题。

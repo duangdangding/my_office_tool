@@ -162,11 +162,24 @@ struct PluginDirectoryView {
 #[serde(rename_all = "camelCase")]
 struct StoredSettings {
     plugin_dir: Option<PathBuf>,
+    #[serde(default)]
+    launch_at_startup: bool,
+    #[serde(default)]
+    silent_start: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppSettingsView {
+    launch_at_startup: bool,
+    silent_start: bool,
+    plugin_dir: PluginDirectoryView,
 }
 
 struct AppState {
     data_dir: PathBuf,
     plugin_dir: Mutex<PathBuf>,
+    settings: Mutex<StoredSettings>,
     rules: Mutex<HashMap<String, PluginRules>>,
     origins: Mutex<HashMap<String, PluginOrigin>>,
     runtimes: Mutex<HashMap<String, PluginRuntime>>,
@@ -217,12 +230,23 @@ fn save_origins(state: &AppState) -> Result<(), String> {
     fs::write(state.data_dir.join(ORIGINS_FILE), bytes).map_err(|e| format!("保存插件来源失败：{e}"))
 }
 
-fn load_plugin_dir(data_dir: &Path) -> PathBuf {
+fn load_settings(data_dir: &Path) -> StoredSettings {
     fs::read_to_string(data_dir.join(SETTINGS_FILE))
         .ok()
         .and_then(|text| serde_json::from_str::<StoredSettings>(&text).ok())
-        .and_then(|settings| settings.plugin_dir)
-        .unwrap_or_else(|| data_dir.join("plugins"))
+        .unwrap_or_default()
+}
+
+fn save_settings(state: &AppState) -> Result<(), String> {
+    fs::create_dir_all(&state.data_dir).map_err(|e| format!("创建配置目录失败：{e}"))?;
+    let settings = state.settings.lock().unwrap();
+    let bytes = serde_json::to_vec_pretty(&*settings).map_err(|e| e.to_string())?;
+    fs::write(state.data_dir.join(SETTINGS_FILE), bytes).map_err(|e| format!("保存设置失败：{e}"))
+}
+
+#[cfg(test)]
+fn load_plugin_dir(data_dir: &Path) -> PathBuf {
+    load_settings(data_dir).plugin_dir.unwrap_or_else(|| data_dir.join("plugins"))
 }
 
 fn plugins_dir(state: &AppState) -> PathBuf {
@@ -238,11 +262,9 @@ fn plugin_directory_view(state: &AppState) -> PluginDirectoryView {
 }
 
 fn save_plugin_dir(state: &AppState, path: &Path) -> Result<(), String> {
-    fs::create_dir_all(&state.data_dir).map_err(|e| format!("创建配置目录失败：{e}"))?;
     let default = state.data_dir.join("plugins");
-    let settings = StoredSettings { plugin_dir: (path != default).then(|| path.to_path_buf()) };
-    let bytes = serde_json::to_vec_pretty(&settings).map_err(|e| e.to_string())?;
-    fs::write(state.data_dir.join(SETTINGS_FILE), bytes).map_err(|e| format!("保存插件目录设置失败：{e}"))
+    state.settings.lock().unwrap().plugin_dir = (path != default).then(|| path.to_path_buf());
+    save_settings(state).map_err(|e| format!("保存插件目录设置失败：{e}"))
 }
 
 fn safe_join(root: &Path, relative: &str) -> Result<PathBuf, String> {
@@ -730,6 +752,88 @@ fn set_plugin_directory(app: AppHandle, state: State<'_, AppState>, path: String
     Ok(plugin_directory_view(&state))
 }
 
+#[cfg(windows)]
+fn apply_system_autostart(enabled: bool) -> Result<(), String> {
+    use winreg::{enums::*, RegKey};
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let (key, _) = hkcu
+        .create_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Run")
+        .map_err(|e| format!("打开系统启动项失败：{e}"))?;
+    if enabled {
+        let exe = std::env::current_exe().map_err(|e| format!("读取主程序路径失败：{e}"))?;
+        key.set_value("OfficeToolbox", &format!("\"{}\"", exe.to_string_lossy()))
+            .map_err(|e| format!("写入开机启动项失败：{e}"))
+    } else {
+        match key.delete_value("OfficeToolbox") {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("移除开机启动项失败：{error}")),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn apply_system_autostart(enabled: bool) -> Result<(), String> {
+    let home = dirs::home_dir().ok_or_else(|| "无法定位用户目录".to_string())?;
+    let agents = home.join("Library").join("LaunchAgents");
+    let plist = agents.join("com.office.toolbox.plist");
+    if !enabled {
+        if plist.exists() {
+            let _ = Command::new("launchctl").arg("unload").arg(&plist).status();
+            fs::remove_file(&plist).map_err(|e| format!("移除开机启动项失败：{e}"))?;
+        }
+        return Ok(());
+    }
+    fs::create_dir_all(&agents).map_err(|e| format!("创建启动项目录失败：{e}"))?;
+    let exe = std::env::current_exe().map_err(|e| format!("读取主程序路径失败：{e}"))?;
+    let escape_xml = |value: &str| value.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    let content = format!(r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.office.toolbox</string>
+  <key>ProgramArguments</key>
+  <array><string>{}</string></array>
+  <key>RunAtLoad</key><true/>
+</dict>
+</plist>
+"#, escape_xml(&exe.to_string_lossy()));
+    fs::write(&plist, content).map_err(|e| format!("写入开机启动项失败：{e}"))?;
+    let _ = Command::new("launchctl").arg("load").arg(&plist).status();
+    Ok(())
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn apply_system_autostart(_enabled: bool) -> Result<(), String> {
+    Err("当前系统暂不支持配置开机启动".into())
+}
+
+#[tauri::command]
+fn get_settings(state: State<'_, AppState>) -> AppSettingsView {
+    let settings = state.settings.lock().unwrap().clone();
+    AppSettingsView {
+        launch_at_startup: settings.launch_at_startup,
+        silent_start: settings.silent_start,
+        plugin_dir: plugin_directory_view(&state),
+    }
+}
+
+#[tauri::command]
+fn set_launch_at_startup(state: State<'_, AppState>, enabled: bool) -> Result<AppSettingsView, String> {
+    apply_system_autostart(enabled)?;
+    state.settings.lock().unwrap().launch_at_startup = enabled;
+    save_settings(&state)?;
+    Ok(get_settings(state))
+}
+
+#[tauri::command]
+fn set_silent_start(state: State<'_, AppState>, enabled: bool) -> Result<AppSettingsView, String> {
+    state.settings.lock().unwrap().silent_start = enabled;
+    save_settings(&state)?;
+    Ok(get_settings(state))
+}
+
 fn copy_declared_executables(manifest: &PluginManifest, source: &Path, target: &Path) -> Result<(), String> {
     let source = fs::canonicalize(source).map_err(|e| format!("读取插件目录失败：{e}"))?;
     for candidate in &manifest.entry.executable {
@@ -844,6 +948,97 @@ fn import_git_plugin(app: AppHandle, state: State<'_, AppState>, url: String) ->
     result
 }
 
+fn archive_download_url(url: &str) -> Result<String, String> {
+    let trimmed = url.trim().trim_end_matches('/');
+    if !matches!(trimmed.split("://").next(), Some("http" | "https")) {
+        return Err("压缩包地址必须以 http:// 或 https:// 开头".into());
+    }
+    let base = trimmed.strip_suffix(".git").unwrap_or(trimmed).trim_end_matches('/');
+    if base.to_ascii_lowercase().ends_with(".zip") {
+        return Ok(base.into());
+    }
+    if base.split("://").nth(1).is_some_and(|rest| rest.starts_with("github.com/")) {
+        return Ok(format!("{base}/archive/HEAD.zip"));
+    }
+    Err("非 GitHub 地址请直接提供以 .zip 结尾的压缩包下载链接".into())
+}
+
+fn locate_archive_plugin_root(extracted: &Path) -> Result<PathBuf, String> {
+    if extracted.join(MANIFEST_FILE).is_file() {
+        return Ok(extracted.to_path_buf());
+    }
+    let mut candidates = Vec::new();
+    for entry in fs::read_dir(extracted).map_err(|e| format!("读取压缩包目录失败：{e}"))?.flatten() {
+        let path = entry.path();
+        if path.is_dir() && path.join(MANIFEST_FILE).is_file() {
+            candidates.push(path);
+        }
+    }
+    match candidates.len() {
+        1 => Ok(candidates.remove(0)),
+        0 => Err("压缩包中没有找到 office-plugin.json，请确认仓库根目录包含插件清单".into()),
+        _ => Err("压缩包中包含多个插件，请改用单独插件的压缩包或本地目录导入".into()),
+    }
+}
+
+/// 下载 ZIP 并解压，返回（临时目录，插件根目录）。调用方负责清理临时目录。
+fn fetch_archive_plugin(state: &AppState, url: &str) -> Result<(PathBuf, PathBuf), String> {
+    let download_url = archive_download_url(url)?;
+    let temp = temporary_path(state, "plugin-archive")?;
+    fs::create_dir_all(&temp).map_err(|e| format!("创建临时导入目录失败：{e}"))?;
+    let result = (|| {
+        let archive_path = temp.join("plugin.zip");
+        let response = ureq::get(&download_url)
+            .timeout(std::time::Duration::from_secs(120))
+            .call()
+            .map_err(|e| format!("下载插件压缩包失败：{e}"))?;
+        let mut reader = response.into_reader();
+        let mut file = fs::File::create(&archive_path).map_err(|e| format!("创建压缩包缓存失败：{e}"))?;
+        std::io::copy(&mut reader, &mut file).map_err(|e| format!("保存插件压缩包失败：{e}"))?;
+        drop(file);
+
+        let extracted = temp.join("extracted");
+        fs::create_dir_all(&extracted).map_err(|e| format!("创建解压目录失败：{e}"))?;
+        let file = fs::File::open(&archive_path).map_err(|e| format!("读取插件压缩包失败：{e}"))?;
+        let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("压缩包格式无效：{e}"))?;
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).map_err(|e| format!("读取压缩包内容失败：{e}"))?;
+            let Some(relative) = entry.enclosed_name().map(|path| path.to_path_buf()) else { continue };
+            let target = extracted.join(relative);
+            if entry.is_dir() {
+                fs::create_dir_all(&target).map_err(|e| format!("创建解压目录失败：{e}"))?;
+                continue;
+            }
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).map_err(|e| format!("创建解压目录失败：{e}"))?;
+            }
+            let mut output = fs::File::create(&target).map_err(|e| format!("写入解压文件失败：{e}"))?;
+            std::io::copy(&mut entry, &mut output).map_err(|e| format!("解压插件失败：{e}"))?;
+        }
+        locate_archive_plugin_root(&extracted)
+    })();
+    match result {
+        Ok(root) => Ok((temp, root)),
+        Err(error) => {
+            let _ = fs::remove_dir_all(&temp);
+            Err(error)
+        }
+    }
+}
+
+#[tauri::command(async)]
+fn import_archive_plugin(app: AppHandle, state: State<'_, AppState>, url: String) -> Result<PluginView, String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err("请输入插件压缩包地址或 GitHub 仓库地址".into());
+    }
+    let (temp, source) = fetch_archive_plugin(&state, url)?;
+    let origin = PluginOrigin { kind: "archive".into(), local_path: None, repository: Some(sanitize_repository_url(url)) };
+    let result = install_plugin(&app, &state, &source, origin);
+    let _ = fs::remove_dir_all(&temp);
+    result
+}
+
 fn replace_plugin_from_source(app: &AppHandle, state: &AppState, plugin: &PluginView, source: &Path) -> Result<PluginView, String> {
     let manifest = read_manifest(source)?;
     ensure_plugin_compatible(source, &manifest)?;
@@ -911,6 +1106,13 @@ fn update_plugin(app: AppHandle, state: State<'_, AppState>, id: String) -> Resu
             clone_git_repository(repository, &checkout)?;
             let result = replace_plugin_from_source(&app, &state, &plugin, &checkout);
             let _ = fs::remove_dir_all(&checkout);
+            result
+        }
+        "archive" => {
+            let repository = origin.repository.as_deref().ok_or_else(|| "未记录压缩包地址，无法更新；请移除后重新导入".to_string())?;
+            let (temp, source) = fetch_archive_plugin(&state, repository)?;
+            let result = replace_plugin_from_source(&app, &state, &plugin, &source);
+            let _ = fs::remove_dir_all(&temp);
             result
         }
         _ => Err("未知插件来源，无法更新".into()),
@@ -1132,11 +1334,14 @@ fn show_main_window(app: &AppHandle) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let data_dir = default_data_dir();
-    let plugin_dir = load_plugin_dir(&data_dir);
+    let settings = load_settings(&data_dir);
+    let plugin_dir = settings.plugin_dir.clone().unwrap_or_else(|| data_dir.join("plugins"));
+    let silent_start = settings.silent_start;
     let state = AppState {
         rules: Mutex::new(load_rules(&data_dir)),
         origins: Mutex::new(load_origins(&data_dir)),
         plugin_dir: Mutex::new(plugin_dir),
+        settings: Mutex::new(settings),
         data_dir,
         runtimes: Mutex::new(HashMap::new()),
         running: Mutex::new(HashMap::new()),
@@ -1153,6 +1358,10 @@ pub fn run() {
             set_plugin_directory,
             import_plugin,
             import_git_plugin,
+            import_archive_plugin,
+            get_settings,
+            set_launch_at_startup,
+            set_silent_start,
             update_plugin,
             update_plugin_rules,
             launch_plugin,
@@ -1164,7 +1373,7 @@ pub fn run() {
             open_plugin_directory,
             read_plugin_log,
         ])
-        .setup(|app| {
+        .setup(move |app| {
             let show = MenuItem::with_id(app, "show", "显示办公工具箱", true, None::<&str>)?;
             let hide = MenuItem::with_id(app, "hide", "隐藏窗口", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
@@ -1199,6 +1408,15 @@ pub fn run() {
                         let _ = window_handle.hide();
                     }
                 });
+            }
+
+            // 窗口默认不显示，避免静默启动时闪现；普通启动在这里主动显示。
+            if silent_start {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.hide();
+                }
+            } else {
+                show_main_window(app.handle());
             }
 
             let state = app.state::<AppState>();
@@ -1300,6 +1518,7 @@ mod tests {
         let state = AppState {
             data_dir: PathBuf::from("."),
             plugin_dir: Mutex::new(PathBuf::from(".")),
+            settings: Mutex::new(StoredSettings::default()),
             rules: Mutex::new(HashMap::new()),
             origins: Mutex::new(HashMap::new()),
             runtimes: Mutex::new(HashMap::new()),
@@ -1424,6 +1643,7 @@ mod tests {
         let state = AppState {
             data_dir: base.clone(),
             plugin_dir: Mutex::new(base.join("plugins")),
+            settings: Mutex::new(StoredSettings::default()),
             rules: Mutex::new(HashMap::new()),
             origins: Mutex::new(HashMap::new()),
             runtimes: Mutex::new(HashMap::new()),
@@ -1434,5 +1654,22 @@ mod tests {
         save_plugin_dir(&state, &custom).unwrap();
         assert_eq!(load_plugin_dir(&base), custom);
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn github_repository_converts_to_archive_url_without_git() {
+        assert_eq!(
+            archive_download_url("https://github.com/owner/plugin.git").unwrap(),
+            "https://github.com/owner/plugin/archive/HEAD.zip"
+        );
+        assert_eq!(
+            archive_download_url("https://github.com/owner/plugin/").unwrap(),
+            "https://github.com/owner/plugin/archive/HEAD.zip"
+        );
+        assert_eq!(
+            archive_download_url("https://example.com/plugin.zip").unwrap(),
+            "https://example.com/plugin.zip"
+        );
+        assert!(archive_download_url("git@github.com:owner/plugin.git").is_err());
     }
 }

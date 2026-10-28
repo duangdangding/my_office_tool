@@ -32,7 +32,7 @@ export interface PluginManifest {
 }
 
 export interface PluginOrigin {
-  type: "local" | "git";
+  type: "local" | "git" | "archive";
   localPath?: string;
   repository?: string;
 }
@@ -40,6 +40,12 @@ export interface PluginOrigin {
 export interface PluginDirectoryView {
   path: string;
   isDefault: boolean;
+}
+
+export interface AppSettings {
+  launchAtStartup: boolean;
+  silentStart: boolean;
+  pluginDir: PluginDirectoryView;
 }
 
 export interface PluginView {

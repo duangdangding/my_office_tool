@@ -5,6 +5,8 @@ import {
   choosePluginStorageDirectory,
   extractPlugin,
   getPluginDirectory,
+  getSettings,
+  importArchivePlugin,
   importGitPlugin,
   importPlugin,
   isDesktop,
@@ -14,11 +16,13 @@ import {
   readPluginLog,
   removePlugin,
   saveRules,
+  setLaunchAtStartup,
   setPluginDirectory,
+  setSilentStart,
   stopPlugin,
   updatePlugin,
 } from "./api";
-import type { PluginRules, PluginStatus, PluginView } from "./types";
+import type { AppSettings, PluginRules, PluginStatus, PluginView } from "./types";
 import type { Update } from "@tauri-apps/plugin-updater";
 import {
   checkAppUpdate,
@@ -29,7 +33,7 @@ import {
   type InstallKind,
 } from "./updater";
 
-type ViewKey = "all" | "running" | "rules" | "about";
+type ViewKey = "all" | "running" | "rules" | "settings" | "about";
 type UpdatePhase = "idle" | "checking" | "available" | "downloading" | "installing" | "error";
 
 const app = document.querySelector<HTMLElement>("#app")!;
@@ -39,6 +43,8 @@ let currentView: ViewKey = "all";
 let query = "";
 let loading = true;
 let busyId = "";
+let settings: AppSettings | null = null;
+let settingsBusy = "";
 let appVersion = "…";
 let installKind: InstallKind | null = null;
 let updatePhase: UpdatePhase = "idle";
@@ -72,6 +78,7 @@ const icons: Record<string, string> = {
   shield: '<path d="M12 3 4 6v5c0 5 3.5 8.5 8 10 4.5-1.5 8-5 8-10V6l-8-3Z"/><path d="m9 12 2 2 4-4"/>',
   arrow: '<path d="M5 12h14M14 7l5 5-5 5"/>',
   box: '<path d="m12 3 9 5-9 5-9-5 9-5Z"/><path d="m3 12 9 5 9-5M3 16l9 5 9-5"/>',
+  settings: '<circle cx="12" cy="12" r="3"/><path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.66 6.34l1.41-1.41"/>',
 };
 
 function icon(name: string, size = 20): string {
@@ -101,7 +108,7 @@ app.innerHTML = `
       <button data-action="nav" data-view="rules">${icon("sliders")}<span>规则中心</span></button>
     </nav>
     <div class="nav-label nav-label-second">支持</div>
-    <nav class="nav"><button data-action="nav" data-view="about">${icon("info")}<span>关于与插件规范</span></button></nav>
+    <nav class="nav"><button data-action="nav" data-view="settings">${icon("settings")}<span>设置</span></button><button data-action="nav" data-view="about">${icon("info")}<span>关于与插件规范</span></button></nav>
     <div class="sidebar-spacer"></div>
     <div class="local-card"><span class="local-icon">${icon("shield", 19)}</span><b>本地，更安心</b><p>工具与数据留在你的电脑，按需启动每一项能力。</p><span class="local-status"><i></i>本地服务正常</span></div>
     <div class="sidebar-foot"><span class="avatar">办</span><div><b>我的办公空间</b><small>个人工作站</small></div><span>•••</span></div>
@@ -140,7 +147,7 @@ function pluginCard(plugin: PluginView): string {
   return `<article class="plugin-card ${!rules.enabled ? "disabled" : ""}">
     <div class="card-top">
       <div class="plugin-icon ${manifest.icon}">${icon(manifest.icon, 28)}</div>
-      <div class="card-badges"><span class="status-badge ${status.className}"><i></i>${status.label}</span><span class="source-badge">${plugin.source === "builtin" ? "内置" : plugin.origin?.type === "git" ? "Git 导入" : "本地导入"}</span></div>
+      <div class="card-badges"><span class="status-badge ${status.className}"><i></i>${status.label}</span><span class="source-badge">${plugin.source === "builtin" ? "内置" : plugin.origin?.type === "git" ? "Git 导入" : plugin.origin?.type === "archive" ? "压缩包导入" : "本地导入"}</span></div>
     </div>
     <div class="plugin-title"><h3>${escape(manifest.name)}</h3><span>v${escape(manifest.version)}</span></div>
     <div class="plugin-category">${escape(manifest.category || "办公效率")}</div>
@@ -180,6 +187,20 @@ function rulesContent(): string {
   return `<section class="page-heading compact"><div><p class="eyebrow">PLUGIN GOVERNANCE</p><h1>规则中心</h1><p>统一控制启停、启动方式与插件协作能力。</p></div></section>
     <div class="rule-notice">${icon("shield", 22)}<div><b>规则清晰，边界也清晰</b><p>启停与随工具箱启动由本体直接管理；网络、剪贴板、文件等能力规则通过环境变量下发，需插件按规范适配，并非操作系统级沙箱。</p></div></div>
     <section class="rules-list">${plugins.map((plugin) => `<article class="rule-row"><div class="plugin-icon small ${plugin.manifest.icon}">${icon(plugin.manifest.icon, 22)}</div><div class="rule-plugin"><b>${escape(plugin.manifest.name)}</b><span>${escape(plugin.manifest.id)} · ${plugin.rules.detach ? "独立启动" : "工具箱托管"}</span></div><div class="rule-tags"><span class="${plugin.rules.enabled ? "on" : ""}">${plugin.rules.enabled ? "已启用" : "已停用"}</span><span class="${plugin.rules.autoStart ? "on" : ""}">${plugin.rules.autoStart ? "自动启动" : "手动启动"}</span></div><button class="button subtle" data-action="rules" data-id="${plugin.manifest.id}">配置规则${icon("arrow", 15)}</button></article>`).join("")}</section>`;
+}
+
+function settingToggle(key: "launchAtStartup" | "silentStart", title: string, description: string, checked: boolean): string {
+  const disabled = settingsBusy === key ? "disabled" : "";
+  return `<label class="form-toggle"><div><b>${title}</b><p>${description}</p></div><input type="checkbox" data-action="setting-toggle" data-setting="${key}" ${checked ? "checked" : ""} ${disabled}/><span class="toggle-track"></span></label>`;
+}
+
+function settingsContent(): string {
+  if (!settings) {
+    return `<section class="page-heading compact"><div><p class="eyebrow">PREFERENCES</p><h1>设置</h1><p>管理工具箱的启动行为和插件存放位置。</p></div></section><div class="loading-state"><span class="spinner dark"></span><p>正在读取设置…</p></div>`;
+  }
+  return `<section class="page-heading compact"><div><p class="eyebrow">PREFERENCES</p><h1>设置</h1><p>管理工具箱的启动行为和插件存放位置。</p></div></section>
+    <section class="spec-card settings-card"><div><span class="section-kicker">STARTUP</span><h2>启动</h2></div><div class="form-section settings-form">${settingToggle("launchAtStartup", "开机启动", "登录系统后自动启动办公工具箱，更改会立即写入系统启动项。", settings.launchAtStartup)}${settingToggle("silentStart", "静默启动", "下次启动时不显示主窗口，只驻留系统托盘；可从托盘菜单打开窗口。", settings.silentStart)}</div></section>
+    <section class="spec-card settings-card"><div><span class="section-kicker">STORAGE</span><h2>插件目录</h2><p class="settings-description">每次启动都会扫描此目录，新导入的插件也复制到这里。切换目录不会迁移或删除旧文件，规则配置会保留。</p></div><div class="settings-directory"><div><b>${settings.pluginDir.isDefault ? "默认目录" : "自定义目录"}</b><code>${escape(settings.pluginDir.path)}</code></div><button class="button subtle" data-action="plugin-directory">${icon("folder", 16)}更改目录</button></div></section>`;
 }
 
 function installKindLabel(): string {
@@ -270,7 +291,7 @@ function aboutContent(): string {
   return `<section class="page-heading compact"><div><p class="eyebrow">OPEN & INDEPENDENT</p><h1>一个开放的小型办公生态</h1><p>工具箱不接管插件的窗口与数据，只提供统一的入口和运行规则。</p></div></section>
     ${appUpdateCard()}
     <section class="architecture-card"><div class="architecture-copy"><span class="section-kicker">运行架构</span><h2>相互独立，才能稳定协作</h2><p>每个工具都是独立进程。一个插件崩溃不会拖垮工具箱；插件也可以脱离本体，使用原来的方式开发、构建和运行。</p><div class="architecture-points"><span>${icon("check", 16)}标准 JSON 清单</span><span>${icon("check", 16)}独立数据目录</span><span>${icon("check", 16)}托管 / 独立双模式</span></div></div><div class="architecture-diagram"><div class="host-node">${icon("grid", 23)}<b>办公工具箱</b><small>规则 · 启停 · 日志</small></div><div class="diagram-lines"><i></i><i></i></div><div class="child-nodes"><span>${icon("rocket", 20)}速启</span><span>${icon("clipboard", 20)}共享剪贴板</span><span>${icon("puzzle", 20)}你的插件</span></div></div></section>
-    <section class="spec-card management-card"><div><span class="section-kicker">PLUGIN MANAGEMENT</span><h2>从导入到更新，统一管理</h2></div><div class="management-grid"><div>${icon("folder", 19)}<b>自定义插件目录</b><p>点击顶部「插件目录」选择存放位置。每次启动自动扫描，后续导入也写入此目录；切换时不迁移旧文件。</p></div><div>${icon("shield", 19)}<b>导入兼容性检查</b><p>支持本地目录和 Git 仓库。导入前检查清单规范、当前平台及启动方式，不兼容时说明原因并停止导入。</p></div><div>${icon("activity", 19)}<b>来源更新</b><p>本地插件从原项目重新同步，Git 插件克隆默认分支的最新内容。校验通过后替换，失败时保留旧版本。</p></div><div>${icon("box", 19)}<b>删除与产物提取</b><p>删除时可选是否同时删除原始本地项目；编译产物可提取到指定目录，并保留相对路径。</p></div></div></section>
+    <section class="spec-card management-card"><div><span class="section-kicker">PLUGIN MANAGEMENT</span><h2>从导入到更新，统一管理</h2></div><div class="management-grid"><div>${icon("folder", 19)}<b>自定义插件目录</b><p>在「设置」中选择存放位置。每次启动自动扫描，后续导入也写入此目录；切换时不迁移旧文件。</p></div><div>${icon("shield", 19)}<b>导入兼容性检查</b><p>支持本地目录、ZIP 压缩包和 Git 仓库；压缩包导入无需安装 Git。导入前检查清单规范、当前平台及启动方式。</p></div><div>${icon("activity", 19)}<b>来源更新</b><p>本地插件从原项目重新同步，Git 与压缩包插件从远程来源获取最新内容。校验通过后替换，失败时保留旧版本。</p></div><div>${icon("box", 19)}<b>删除与产物提取</b><p>删除时可选是否同时删除原始本地项目；编译产物可提取到指定目录，并保留相对路径。</p></div></div></section>
     <section class="spec-card"><div><span class="section-kicker">PLUGIN MANIFEST V1</span><h2>三步接入你的插件</h2></div><ol class="spec-steps"><li><span>01</span><div><b>添加插件清单</b><p>在插件根目录创建 <code>office-plugin.json</code>，声明 id、名称、版本和启动命令；可选 <code>platforms</code> 声明 windows／macos。</p></div></li><li><span>02</span><div><b>声明启动方式</b><p><code>executable</code> 指向已构建程序；<code>dev</code> 声明开发命令；<code>auto</code> 优先程序、回退开发命令。</p></div></li><li><span>03</span><div><b>读取规则并报告就绪</b><p>读取 <code>OFFICE_PLUGIN_RULES_FILE</code> 和 <code>OFFICE_PLUGIN_ALLOW_*</code>；初始化完成后输出 <code>OFFICE_TOOLBOX_READY:插件id</code>。</p></div></li></ol><div class="env-example"><code>OFFICE_PLUGIN_ID=suqi</code><code>OFFICE_PLUGIN_ALLOW_NETWORK=true</code><code>OFFICE_PLUGIN_ALLOW_CLIPBOARD=true</code><code>OFFICE_PLUGIN_DATA_DIR=…</code></div></section>`;
 }
 
@@ -278,6 +299,7 @@ const viewTitles: Record<ViewKey, [string, string]> = {
   all: ["全部工具", "本地插件工作台"],
   running: ["正在运行", "独立进程状态"],
   rules: ["规则中心", "插件运行与能力规则"],
+  settings: ["设置", "启动行为与插件目录"],
   about: ["关于", "插件接入规范"],
 };
 
@@ -286,7 +308,7 @@ function render(): void {
   const count = document.querySelector<HTMLElement>("#nav-count");
   if (count) count.textContent = String(plugins.length);
   const content = document.querySelector<HTMLElement>("#content")!;
-  content.innerHTML = currentView === "rules" ? rulesContent() : currentView === "about" ? aboutContent() : dashboardContent();
+  content.innerHTML = currentView === "rules" ? rulesContent() : currentView === "settings" ? settingsContent() : currentView === "about" ? aboutContent() : dashboardContent();
   document.title = `${viewTitles[currentView][0]} · 办公工具箱`;
 }
 
@@ -313,10 +335,9 @@ function showModal(content: string, className = ""): void {
   modalRoot.innerHTML = `<div class="modal-backdrop ${className}"><section class="modal" role="dialog" aria-modal="true">${content}</section></div>`;
 }
 
-function showImport(mode: "local" | "git" = "local"): void {
-  const local = mode === "local";
-  showModal(`<button class="modal-close" data-action="close-modal" aria-label="关闭">${icon("close")}</button><span class="modal-symbol">${icon("plus", 26)}</span><h2>导入插件</h2><div class="import-source-tabs"><button class="${local ? "active" : ""}" data-action="import-mode" data-mode="local">${icon("folder", 16)}本地项目</button><button class="${local ? "" : "active"}" data-action="import-mode" data-mode="git">${icon("box", 16)}Git 项目</button></div>
-    ${local ? `<p class="modal-intro">选择包含 <code>office-plugin.json</code> 的文件夹。插件会复制到工具箱，原目录保持不变；清单中已有的编译程序也会一并复制。</p><div class="modal-actions"><button class="button subtle" data-action="close-modal">取消</button><button class="button primary" data-action="confirm-import">选择插件文件夹${icon("arrow", 16)}</button></div>` : `<form id="git-import-form"><p class="modal-intro">输入 Git 仓库地址，工具箱会克隆默认分支及其子模块。仓库根目录必须包含 <code>office-plugin.json</code>，本机需已安装 Git。</p><label class="field-label" for="git-repository">仓库地址</label><input class="text-input" id="git-repository" name="repository" type="text" placeholder="https://github.com/owner/plugin.git" autocomplete="off" required autofocus/><div class="modal-actions"><button type="button" class="button subtle" data-action="close-modal">取消</button><button class="button primary" type="submit">克隆并导入${icon("arrow", 16)}</button></div></form>`}
+function showImport(mode: "local" | "git" | "archive" = "local"): void {
+  showModal(`<button class="modal-close" data-action="close-modal" aria-label="关闭">${icon("close")}</button><span class="modal-symbol">${icon("plus", 26)}</span><h2>导入插件</h2><div class="import-source-tabs"><button class="${mode === "local" ? "active" : ""}" data-action="import-mode" data-mode="local">${icon("folder", 16)}本地项目</button><button class="${mode === "archive" ? "active" : ""}" data-action="import-mode" data-mode="archive">${icon("box", 16)}压缩包（免 Git）</button><button class="${mode === "git" ? "active" : ""}" data-action="import-mode" data-mode="git">${icon("terminal", 16)}Git 项目</button></div>
+    ${mode === "local" ? `<p class="modal-intro">选择包含 <code>office-plugin.json</code> 的文件夹。插件会复制到工具箱，原目录保持不变；清单中已有的编译程序也会一并复制。</p><div class="modal-actions"><button class="button subtle" data-action="close-modal">取消</button><button class="button primary" data-action="confirm-import">选择插件文件夹${icon("arrow", 16)}</button></div>` : mode === "archive" ? `<form id="archive-import-form"><p class="modal-intro">输入 ZIP 下载地址或 GitHub 仓库地址，工具箱会直接下载并解压，<b>无需安装 Git</b>。GitHub 仓库使用默认分支；包含 Git 子模块的插件请改用 Git 导入。</p><label class="field-label" for="archive-repository">压缩包或仓库地址</label><input class="text-input" id="archive-repository" name="repository" type="text" placeholder="https://github.com/owner/plugin 或 https://…/plugin.zip" autocomplete="off" required autofocus/><div class="modal-actions"><button type="button" class="button subtle" data-action="close-modal">取消</button><button class="button primary" type="submit">下载并导入${icon("arrow", 16)}</button></div></form>` : `<form id="git-import-form"><p class="modal-intro">输入 Git 仓库地址，工具箱会克隆默认分支及其子模块。仓库根目录必须包含 <code>office-plugin.json</code>，本机需已安装 Git。</p><label class="field-label" for="git-repository">仓库地址</label><input class="text-input" id="git-repository" name="repository" type="text" placeholder="https://github.com/owner/plugin.git" autocomplete="off" required autofocus/><div class="modal-actions"><button type="button" class="button subtle" data-action="close-modal">取消</button><button class="button primary" type="submit">克隆并导入${icon("arrow", 16)}</button></div></form>`}
     <div class="warning-box import-warning">${icon("shield", 20)}<p>导入前会检查清单规范、当前平台和启动方式，不兼容的插件不会写入插件目录。插件是可执行代码，请只导入信任的来源。</p></div>`, "import-modal");
 }
 
@@ -354,9 +375,9 @@ function showUpdate(id: string): void {
     toast("此插件没有可用的更新来源。", "error");
     return;
   }
-  const isGit = plugin.origin.type === "git";
-  const source = isGit ? plugin.origin.repository : plugin.origin.localPath;
-  showModal(`<button class="modal-close" data-action="close-modal">${icon("close")}</button><span class="modal-symbol">${icon("activity", 25)}</span><h2>更新「${escape(plugin.manifest.name)}」</h2><p class="modal-intro">${isGit ? "从 Git 默认分支获取最新内容" : "从原始本地项目重新同步"}，并检查清单、平台兼容性、启动方式及插件 id。更新会停止托管进程，失败时保留旧版本。</p>${source ? `<div class="standalone-info"><b>更新来源</b><code>${escape(source)}</code></div>` : `<div class="error-box"><b>更新来源不完整</b><p>请移除后重新导入此插件。</p></div>`}<div class="modal-actions"><button class="button subtle" data-action="close-modal">取消</button><button class="button primary" data-action="confirm-update" data-id="${id}" ${source ? "" : "disabled"}>确认更新${icon("arrow", 16)}</button></div>`);
+  const source = plugin.origin.type === "local" ? plugin.origin.localPath : plugin.origin.repository;
+  const sourceDescription = plugin.origin.type === "git" ? "从 Git 默认分支获取最新内容" : plugin.origin.type === "archive" ? "重新下载压缩包并解压最新内容，无需 Git" : "从原始本地项目重新同步";
+  showModal(`<button class="modal-close" data-action="close-modal">${icon("close")}</button><span class="modal-symbol">${icon("activity", 25)}</span><h2>更新「${escape(plugin.manifest.name)}」</h2><p class="modal-intro">${sourceDescription}，并检查清单、平台兼容性、启动方式及插件 id。更新会停止托管进程，失败时保留旧版本。</p>${source ? `<div class="standalone-info"><b>更新来源</b><code>${escape(source)}</code></div>` : `<div class="error-box"><b>更新来源不完整</b><p>请移除后重新导入此插件。</p></div>`}<div class="modal-actions"><button class="button subtle" data-action="close-modal">取消</button><button class="button primary" data-action="confirm-update" data-id="${id}" ${source ? "" : "disabled"}>确认更新${icon("arrow", 16)}</button></div>`);
 }
 
 function ruleToggle(name: keyof PluginRules, title: string, description: string, checked: boolean): string {
@@ -435,6 +456,7 @@ document.addEventListener("click", (event) => {
       if (!path) return;
       try {
         const directory = await setPluginDirectory(path);
+        settings = await getSettings();
         closeModal();
         await refresh();
         toast(`插件目录已切换为：${directory.path}`, "success");
@@ -442,7 +464,10 @@ document.addEventListener("click", (event) => {
     })();
   }
   else if (action === "import") showImport();
-  else if (action === "import-mode") showImport(target.dataset.mode === "git" ? "git" : "local");
+  else if (action === "import-mode") {
+    const mode = target.dataset.mode;
+    showImport(mode === "git" || mode === "archive" ? mode : "local");
+  }
   else if (action === "confirm-import") {
     void (async () => {
       const path = await choosePluginDirectory();
@@ -528,6 +553,26 @@ document.addEventListener("click", (event) => {
 });
 
 document.addEventListener("change", (event) => {
+  const settingInput = (event.target as HTMLElement).closest<HTMLInputElement>('input[data-action="setting-toggle"]');
+  if (settingInput) {
+    const key = settingInput.dataset.setting;
+    if ((key !== "launchAtStartup" && key !== "silentStart") || !settings || settingsBusy) return;
+    const enabled = settingInput.checked;
+    settingsBusy = key;
+    render();
+    void (async () => {
+      try {
+        settings = key === "launchAtStartup" ? await setLaunchAtStartup(enabled) : await setSilentStart(enabled);
+        toast(key === "launchAtStartup" ? (enabled ? "已开启开机启动。" : "已关闭开机启动。") : (enabled ? "已开启静默启动，下次启动生效。" : "已关闭静默启动。"), "success");
+      } catch (error) {
+        toast(String(error), "error");
+      } finally {
+        settingsBusy = "";
+        render();
+      }
+    })();
+    return;
+  }
   const input = (event.target as HTMLElement).closest<HTMLInputElement>('input[data-action="toggle"]');
   if (!input) return;
   const plugin = plugins.find((item) => item.manifest.id === input.dataset.id);
@@ -546,6 +591,16 @@ document.addEventListener("submit", (event) => {
       return;
     }
     void performImport(() => importGitPlugin(url));
+    return;
+  }
+  if (form.id === "archive-import-form") {
+    event.preventDefault();
+    const url = form.querySelector<HTMLInputElement>('[name="repository"]')?.value.trim() ?? "";
+    if (!url) {
+      toast("请输入压缩包或 GitHub 仓库地址。", "error");
+      return;
+    }
+    void performImport(() => importArchivePlugin(url));
     return;
   }
   if (form.id !== "rules-form") return;
@@ -569,7 +624,7 @@ document.addEventListener("submit", (event) => {
 const searchInput = document.querySelector<HTMLInputElement>("#global-search")!;
 searchInput.addEventListener("input", () => {
   query = searchInput.value;
-  if (currentView === "rules" || currentView === "about") currentView = "all";
+  if (currentView === "rules" || currentView === "settings" || currentView === "about") currentView = "all";
   render();
 });
 
@@ -583,6 +638,10 @@ document.addEventListener("keydown", (event) => {
 });
 
 void refresh();
+void getSettings().then((value) => {
+  settings = value;
+  if (currentView === "settings") render();
+}).catch((error) => toast(`读取设置失败：${String(error)}`, "error"));
 void Promise.all([getAppVersion(), getInstallKind()]).then(([version, kind]) => {
   appVersion = version;
   installKind = kind;

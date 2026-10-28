@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import suqiManifest from "../plugins/suqi/office-plugin.json";
 import lscopyManifest from "../plugins/lscopy/office-plugin.json";
-import type { ExtractPluginResult, PluginDirectoryView, PluginManifest, PluginRules, PluginView } from "./types";
+import type { AppSettings, ExtractPluginResult, PluginDirectoryView, PluginManifest, PluginRules, PluginView } from "./types";
 
 export const isDesktop = "__TAURI_INTERNALS__" in window;
 
@@ -37,6 +37,28 @@ export async function getPluginDirectory(): Promise<PluginDirectoryView> {
   return { path: "F:\\workspace\\my\\vscode\\my_office_tool\\plugins", isDefault: false };
 }
 
+const browserSettings: AppSettings = {
+  launchAtStartup: false,
+  silentStart: false,
+  pluginDir: { path: "F:\\workspace\\my\\vscode\\my_office_tool\\plugins", isDefault: false },
+};
+
+export async function getSettings(): Promise<AppSettings> {
+  return isDesktop ? invoke<AppSettings>("get_settings") : clone(browserSettings);
+}
+
+export async function setLaunchAtStartup(enabled: boolean): Promise<AppSettings> {
+  if (isDesktop) return invoke<AppSettings>("set_launch_at_startup", { enabled });
+  browserSettings.launchAtStartup = enabled;
+  return clone(browserSettings);
+}
+
+export async function setSilentStart(enabled: boolean): Promise<AppSettings> {
+  if (isDesktop) return invoke<AppSettings>("set_silent_start", { enabled });
+  browserSettings.silentStart = enabled;
+  return clone(browserSettings);
+}
+
 export async function choosePluginStorageDirectory(): Promise<string | null> {
   if (!isDesktop) return null;
   const selected = await open({ directory: true, multiple: false, title: "选择插件存放目录" });
@@ -68,6 +90,11 @@ export async function importPlugin(path: string): Promise<PluginView> {
 export async function importGitPlugin(url: string): Promise<PluginView> {
   if (!isDesktop) throw new Error("浏览器预览不执行 Git 导入，请在桌面应用中使用此功能。");
   return invoke<PluginView>("import_git_plugin", { url });
+}
+
+export async function importArchivePlugin(url: string): Promise<PluginView> {
+  if (!isDesktop) throw new Error("浏览器预览不执行压缩包导入，请在桌面应用中使用此功能。");
+  return invoke<PluginView>("import_archive_plugin", { url });
 }
 
 export async function updatePlugin(id: string): Promise<PluginView> {
