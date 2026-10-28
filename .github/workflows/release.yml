@@ -62,6 +62,7 @@ jobs:
       - name: Verify project
         run: |
           npm run build
+          node scripts/prepare-bundled-plugins.mjs
           cargo test --manifest-path src-tauri/Cargo.toml
           cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
 

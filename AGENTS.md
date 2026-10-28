@@ -30,6 +30,7 @@ npm install
 npm run dev                 # 仅启动网页预览
 npm run build               # TypeScript + Vite，提交前必跑
 npm run tauri dev           # 完整桌面应用
+node scripts/prepare-bundled-plugins.mjs
 cargo test --manifest-path src-tauri/Cargo.toml
 cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
 ```
@@ -49,6 +50,7 @@ cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
 
 ```bash
 npm run build
+node scripts/prepare-bundled-plugins.mjs
 cargo test --manifest-path src-tauri/Cargo.toml
 cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
 npm run release:check

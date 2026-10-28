@@ -41,6 +41,7 @@ npm run tauri dev
 
 ```bash
 npm run build
+node scripts/prepare-bundled-plugins.mjs
 cargo test --manifest-path src-tauri/Cargo.toml
 cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
 ```
@@ -88,6 +89,7 @@ git push origin main
 
 ```bash
 npm run build
+node scripts/prepare-bundled-plugins.mjs
 cargo test --manifest-path src-tauri/Cargo.toml
 cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
 npm run release:check -- v0.1.0

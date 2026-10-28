@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "identifier": "com.office.toolbox",
   "build": {
-    "beforeDevCommand": "npm run dev -- --port 1420",
+    "beforeDevCommand": "node scripts/prepare-bundled-plugins.mjs && npm run dev -- --port 1420",
     "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "node scripts/prepare-bundled-plugins.mjs && npm run build",
     "frontendDist": "../dist"
