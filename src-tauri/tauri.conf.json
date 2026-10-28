@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "办公工具箱",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "identifier": "com.office.toolbox",
   "build": {
     "beforeDevCommand": "node scripts/prepare-bundled-plugins.mjs && npm run dev -- --port 1420",
@@ -32,6 +32,19 @@
     "icon": ["icons/icon.ico", "icons/icon.png", "icons/icon.icns"],
     "resources": {
       "../.generated/plugins/": "plugins/"
+    },
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "active": true,
+      "endpoints": [
+        "https://github.com/duangdangding/my_office_tool/releases/latest/download/latest.json"
+      ],
+      "pubkey": "ZFc1MGNuVnpkR1ZrSUdOdmJXMWxiblE2SUcxcGJtbHphV2R1SUhCMVlteHBZeUJyWlhrNklEazNNMFJDUWpaRlJrRXdRMEkzUVRFS1VsZFRhSFIzZWpaaWNuTTViRGw2TDJaVFRYRk1aakpHTjJWb05HdHhkbTkyU2t4eE1tUjRUbXBPYm5rMVZYVm9SVWh3VUhkMGFtUUs=",
+      "windows": {
+        "installMode": "passive"
+      }
     }
   }
 }

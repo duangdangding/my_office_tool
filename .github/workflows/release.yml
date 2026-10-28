@@ -35,6 +35,7 @@ jobs:
     env:
       # secrets 不能直接用于 if，先映射到 job 级环境变量。
       WINDOWS_CERT_PFX: ${{ secrets.WINDOWS_CERT_PFX }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
     steps:
       - uses: actions/checkout@v4
 
@@ -91,10 +92,17 @@ jobs:
           }
           $json | ConvertTo-Json -Depth 20 | Set-Content $confPath -Encoding utf8
 
+      # updater 私钥与 Windows 代码签名证书不同；缺少它无法生成可信的更新包。
+      - name: Verify updater signing key
+        if: env.TAURI_SIGNING_PRIVATE_KEY == ''
+        run: echo '缺少 TAURI_SIGNING_PRIVATE_KEY，无法发布应用内更新。' && exit 1
+
       - name: Build release
+        env:
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: npm run tauri build ${{ matrix.target != '' && format('-- --target {0}', matrix.target) || '' }}
 
-      # Release 资产统一使用 ASCII 文件名，避免中文被上传工具移除。
+      # Release 资产统一使用 ASCII 文件名，签名文件必须同步改名。
       - name: Prepare Windows release assets
         if: matrix.id == 'win'
         shell: pwsh
@@ -102,6 +110,9 @@ jobs:
           $ver = "${{ github.ref_name }}" -replace '^v',''
           Get-ChildItem 'src-tauri/target/release/bundle/nsis/*-setup.exe' | ForEach-Object {
             Rename-Item $_.FullName "office-toolbox_${ver}_x64-setup.exe"
+          }
+          Get-ChildItem 'src-tauri/target/release/bundle/nsis/*-setup.exe.sig' | ForEach-Object {
+            Rename-Item $_.FullName "office-toolbox_${ver}_x64-setup.exe.sig"
           }
           Copy-Item 'src-tauri/target/release/office-toolbox.exe' "src-tauri/target/release/office-toolbox_${ver}_x64_portable.exe"
 
@@ -120,6 +131,29 @@ jobs:
             found=1
           done
           [ "$found" -eq 1 ] || { echo '未找到 macOS DMG 产物'; exit 1; }
+          mv "$bundle/macos/"*.app.tar.gz "$bundle/macos/office-toolbox_${ver}_${arch}.app.tar.gz"
+          mv "$bundle/macos/"*.app.tar.gz.sig "$bundle/macos/office-toolbox_${ver}_${arch}.app.tar.gz.sig"
+
+      - name: Generate Windows update fragment
+        if: matrix.id == 'win'
+        shell: pwsh
+        run: |
+          $ver = "${{ github.ref_name }}" -replace '^v',''
+          node scripts/update-manifest.mjs fragment --tag "${{ github.ref_name }}" --platform windows-x86_64 --repository "${{ github.repository }}" --asset "src-tauri/target/release/bundle/nsis/office-toolbox_${ver}_x64-setup.exe" --output latest-win.json
+
+      - name: Generate macOS update fragment
+        if: startsWith(matrix.id, 'mac')
+        shell: bash
+        run: |
+          set -e
+          ver="${GITHUB_REF_NAME#v}"
+          arch="${{ matrix.arch }}"
+          case "$arch" in
+            arm64) platform="darwin-aarch64" ;;
+            x86_64) platform="darwin-x86_64" ;;
+            *) echo "未知架构：$arch"; exit 1 ;;
+          esac
+          node scripts/update-manifest.mjs fragment --tag "$GITHUB_REF_NAME" --platform "$platform" --repository "${{ github.repository }}" --asset "${{ matrix.bundle }}/macos/office-toolbox_${ver}_${arch}.app.tar.gz" --output "latest-${{ matrix.id }}.json"
 
       - name: Generate Windows checksums
         if: matrix.id == 'win'
@@ -144,10 +178,19 @@ jobs:
           bundle="${{ matrix.bundle }}"
           arch="${{ matrix.arch }}"
           ver="${GITHUB_REF_NAME#v}"
-          file="office-toolbox_${ver}_${arch}.dmg"
-          (cd "$bundle/dmg" && shasum -a 256 "$file") > "sha256sums-macos-${arch}.txt"
-          (cd "$bundle/dmg" && md5 -r "$file") > "md5sums-macos-${arch}.txt"
+          : > "sha256sums-macos-${arch}.txt"
+          : > "md5sums-macos-${arch}.txt"
+          for file in "$bundle/dmg/office-toolbox_${ver}_${arch}.dmg" "$bundle/macos/office-toolbox_${ver}_${arch}.app.tar.gz"; do
+            (cd "$(dirname "$file")" && shasum -a 256 "$(basename "$file")") >> "sha256sums-macos-${arch}.txt"
+            (cd "$(dirname "$file")" && md5 -r "$(basename "$file")") >> "md5sums-macos-${arch}.txt"
+          done
           cat "sha256sums-macos-${arch}.txt"
+
+      - name: Upload update fragment
+        uses: actions/upload-artifact@v4
+        with:
+          name: update-manifest-${{ matrix.id }}
+          path: latest-${{ matrix.id }}.json
 
       - name: Create Windows release
         if: matrix.id == 'win'
@@ -159,6 +202,7 @@ jobs:
           prerelease: false
           files: |
             src-tauri/target/release/bundle/nsis/office-toolbox_*_x64-setup.exe
+            src-tauri/target/release/bundle/nsis/office-toolbox_*_x64-setup.exe.sig
             src-tauri/target/release/office-toolbox_*_x64_portable.exe
             sha256sums-windows.txt
             md5sums-windows.txt
@@ -173,5 +217,29 @@ jobs:
           prerelease: false
           files: |
             ${{ matrix.bundle }}/dmg/office-toolbox_*_${{ matrix.arch }}.dmg
+            ${{ matrix.bundle }}/macos/office-toolbox_*_${{ matrix.arch }}.app.tar.gz
+            ${{ matrix.bundle }}/macos/office-toolbox_*_${{ matrix.arch }}.app.tar.gz.sig
             sha256sums-macos-${{ matrix.arch }}.txt
             md5sums-macos-${{ matrix.arch }}.txt
+
+  latest:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download update fragments
+        uses: actions/download-artifact@v4
+        with:
+          pattern: update-manifest-*
+          path: update-manifest
+          merge-multiple: true
+
+      - name: Merge latest manifest
+        run: node scripts/update-manifest.mjs merge --output latest.json update-manifest/latest-win.json update-manifest/latest-mac-arm64.json update-manifest/latest-mac-x86_64.json
+
+      - name: Upload latest manifest
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: latest.json

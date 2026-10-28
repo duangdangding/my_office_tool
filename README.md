@@ -11,6 +11,16 @@
 
 > 能力规则是插件间的协作约定，需要插件主动适配，并非操作系统级沙箱。
 
+## 插件目录、导入与更新
+
+- **自定义插件目录**：点击顶部「插件目录」选择存放位置，设置持久化保存。每次启动都会扫描该目录，新导入的插件也复制到这里。切换目录不会迁移或删除旧文件；托管中的导入插件会先停止，独立运行的插件需先退出。
+- **本地项目**：选择包含 `office-plugin.json` 的目录。工具箱会复制源码和清单中已存在的 `entry.executable` 程序，但不会复制整个 `target/`、`dist/` 等编译缓存，也不会修改原项目。
+- **Git 项目**：输入仓库地址，工具箱使用本机 Git 浅克隆默认分支及子模块，再按本地项目的方式导入。仓库根目录必须包含插件清单；克隆失败会显示 Git 错误，不会保留临时副本。
+- **兼容性检查**：导入时校验清单规范版本、插件 id、启动命令和路径。可在清单中使用 `platforms: ["windows", "macos"]` 声明支持平台；未声明时按通用插件处理。当前平台不受支持，或既没有已编译程序又没有有效开发启动目录时，会拒绝导入并说明原因。
+- **插件更新**：本地插件从原项目重新同步，Git 插件从记录的仓库默认分支获取最新内容。更新会再次执行兼容性检查并要求插件 id 不变；先复制到临时目录，校验成功后替换旧副本，替换失败会恢复旧版本。内置插件随工具箱发布，不能单独更新。
+- **删除插件**：默认只删除工具箱中的副本。对于本地项目导入的插件，可显式勾选同时删除原始项目；删除前会重新核对目录及插件 id，避免误删已变化的位置。早期未记录来源的导入插件不能删除原项目。
+- **提取编译产物**：在插件卡片或规则窗口选择「提取产物」，再选择目标文件夹。工具箱只提取 `entry.executable` 中实际存在的文件，在 `<目标目录>/<插件id>-compiled/` 下保留相对路径，不执行编译，也不复制其他构建缓存。本地导入插件会优先提取原项目中的最新产物，找不到时再使用工具箱副本。
+
 ## 启动状态与就绪信号
 
 点击启动后，插件会先进入「启动中」，初始化完成后才显示「运行中」。开发启动最长等待 30 分钟，首次编译不会过早被判定为成功；启动或编译失败会显示详细错误和最近 64 KB 日志，也可以取消启动。
@@ -26,6 +36,16 @@ OFFICE_TOOLBOX_READY:suqi
 ## 系统托盘
 
 主程序启动后显示系统托盘图标。单击图标或选择「显示办公工具箱」可恢复主窗口，右键菜单支持显示、隐藏和退出。点击窗口关闭按钮只会隐藏到托盘；从托盘选择「退出」才会结束主程序并停止托管插件。
+
+## 主程序更新
+
+在「关于与插件规范」页面顶部可查看当前版本和安装方式，并手动检查更新：
+
+- **Windows 安装版与 macOS**：发现新版本后点击「下载并安装」。更新包来自本仓库 GitHub Releases，下载后验证 Tauri updater 签名，再安装并重启。安装期间主程序和托管插件会退出。
+- **Windows 便携版**：点击「前往下载」打开最新发布页，退出主程序后用新版便携 exe 替换原文件。便携版不会调用 NSIS 安装器，避免在电脑中生成另一个安装副本。
+- 下载或安装失败会保留错误信息，可重试或打开发布页面手动下载。`latest.json` 在 Windows 和两种 macOS 架构都构建完成后才发布。
+
+旧版本没有主程序更新入口，需要先从 GitHub Releases 手动安装首个包含更新功能的版本；之后的版本才能直接从此页面升级。
 
 ## 开发
 
@@ -109,13 +129,14 @@ git push origin v0.1.0
 
 发布产物：
 
-- `office-toolbox_X.Y.Z_x64-setup.exe`：Windows NSIS 安装包。
+- `office-toolbox_X.Y.Z_x64-setup.exe` 及 `.sig`：Windows NSIS 安装包与 updater 签名。
 - `office-toolbox_X.Y.Z_x64_portable.exe`：Windows 便携版。
-- `office-toolbox_X.Y.Z_arm64.dmg`：macOS Apple Silicon 版本。
-- `office-toolbox_X.Y.Z_x86_64.dmg`：macOS Intel 版本。
+- `office-toolbox_X.Y.Z_arm64.dmg`、`office-toolbox_X.Y.Z_x86_64.dmg`：macOS Apple Silicon／Intel 安装镜像。
+- `office-toolbox_X.Y.Z_arm64.app.tar.gz`、`office-toolbox_X.Y.Z_x86_64.app.tar.gz` 及各自 `.sig`：macOS 更新包与签名。
+- `latest.json`：合并 Windows x64、macOS ARM64 和 macOS x64 后的应用更新清单。
 - `sha256sums-windows.txt`、`sha256sums-macos-*.txt` 及对应 MD5 文件：各平台校验文件。
 
-发布资产统一使用 ASCII 文件名，避免中文名称在上传时被移除。标签、三处项目版本和锁文件版本必须一致，否则 CI 会在构建前停止。
+发布资产统一使用 ASCII 文件名，避免中文名称在上传时被移除；安装包或更新包改名时，对应 `.sig` 必须同步改名。标签、三处项目版本和锁文件版本必须一致，否则 CI 会在构建前停止。`scripts/update-manifest.mjs` 负责生成各平台片段并合并清单，同时校验平台数量、版本和最终资产 URL。
 
 ### 3. 确认后填写 Release notes
 
@@ -127,20 +148,20 @@ GITHUB_REPOSITORY=owner/repo GH_TOKEN=... npm run release:notes -- v0.1.0 releas
 
 脚本会更新说明、回读核对正文并列出资产。未提供 `GH_TOKEN` 时会尝试读取 Git 凭据管理器，**不要打印或提交 token**。
 
-## Windows 代码签名（可选）
+## 更新签名与 Windows 代码签名
 
-在 GitHub 仓库配置：
+主程序使用独立的 Tauri updater minisign 密钥，不能复用速启或共享剪贴板的密钥。首次发版前必须在 GitHub 仓库配置：
 
-- `WINDOWS_CERT_PFX`：PFX 证书的 base64 内容。
-- `WINDOWS_CERT_PASSWORD`：证书密码。
+- `TAURI_SIGNING_PRIVATE_KEY`：主程序私钥文件的完整内容。
+- `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`：该私钥的密码。
 
-配置后，CI 会通过 `scripts/sign-windows.ps1` 给主程序和安装包签名；未配置时仍可构建未签名版本。
+当前本机密钥位于被 Git 忽略的 `.office-toolbox/updater/`，其中 `.key` 是私钥、`.key.password` 是密码、`.key.pub` 是公钥。请妥善备份，配置 secrets 时不要在日志或终端中打印内容。`src-tauri/tauri.conf.json` 只保存 base64 编码后的公钥；缺少私钥 secret 时 CI 会停止发布。密钥丢失后，旧版本将无法信任使用新密钥签名的更新包。
 
-当前主程序未接入自动更新，所以不发 `latest.json`，也不需要 updater 签名私钥。
+Windows 代码签名是另一套可选机制。配置 `WINDOWS_CERT_PFX`（PFX 证书的 base64）和 `WINDOWS_CERT_PASSWORD` 后，CI 会通过 `scripts/sign-windows.ps1` 给主程序和安装包签名；未配置时仍可构建未签名版本。代码签名证书不能替代 updater 私钥。
 
 ## macOS 签名与公证
 
-当前发布流程构建未签名、未公证的 Apple Silicon 和 Intel DMG。首次打开可能被 Gatekeeper 拦截；正式公开发布前应配置 Apple Developer ID 签名、公证和 staple，不能把本机未验收的构建当作已完成真机适配。
+当前发布流程构建未签名、未公证的 Apple Silicon 和 Intel DMG。首次打开可能被 Gatekeeper 拦截；正式公开发布前应配置 Apple Developer ID 签名、公证和 staple，不能把本机未验收的构建当作已完成真机适配。updater 的 minisign 只验证更新包来源和完整性，不等同于 Apple 代码签名或公证。
 
 ## 打包与运行注意事项
 

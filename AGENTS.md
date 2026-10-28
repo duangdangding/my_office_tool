@@ -44,7 +44,7 @@ cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
 - 新增功能时同步更新 `README.md`；新增插件字段时同步更新清单说明和校验。
 - 能力规则通过环境变量和规则文件下发，需插件主动适配，**不是操作系统沙箱**。
 - 主程序规则存储在 `%LOCALAPPDATA%/OfficeToolbox/`；插件数据仍由插件自己管理。
-- 导入插件时复制到工具箱数据目录，不修改用户原始插件目录。
+- 导入插件时复制到当前配置的插件目录（默认为工具箱数据目录），不修改用户原始插件目录。
 
 ## 提交前检查
 
@@ -83,7 +83,7 @@ git push origin main
    git push origin vX.Y.Z
    ```
 
-4. `v*` 标签触发 `.github/workflows/release.yml`，产出 Windows NSIS 安装包、便携版 exe、macOS Apple Silicon／Intel DMG，以及分平台的 `sha256sums-windows.txt`、`sha256sums-macos-*.txt` 和对应 MD5 文件。Release 资产使用 ASCII 文件名，避免中文文件名被上传工具剥掉。
+4. `v*` 标签触发 `.github/workflows/release.yml`，产出 Windows NSIS 安装包及 `.sig`、便携版 exe、macOS Apple Silicon／Intel DMG 与 `.app.tar.gz` 及 `.sig`，最后合并并上传 `latest.json`，以及分平台 SHA-256／MD5 文件。Release 资产使用 ASCII 文件名，重命名安装包或更新包时必须同步重命名 `.sig`，避免与清单 URL 不一致。
 5. **构建结果由用户自行查看确认**。助手不要通过 GitHub API、gh CLI、轮询或日志下载查询 Actions 状态；推完标签即停下，等用户主动告知结果。
 6. 用户确认成功后，新建 `release-notes-X.Y.Z.md`，更新 Release 说明：
 
@@ -95,10 +95,12 @@ git push origin main
 
 ## 签名与发布注意事项
 
-- Windows 代码签名为可选项。配置仓库 secrets `WINDOWS_CERT_PFX`（PFX 的 base64）和 `WINDOWS_CERT_PASSWORD` 后，CI 会注入 `signCommand` 并调用 `scripts/sign-windows.ps1`。
-- macOS 当前仅配置 Apple Silicon／Intel 构建，未签名、未公证；正式公开发布前需要另行配置 Apple Developer ID 签名、公证、staple 和真机验收。
-- 不要把证书、私钥或密码写入仓库、日志或 `tauri.conf.json`。
-- 当前主程序没有接入 updater，因此发布流程**不生成 `latest.json`，也不需要 Tauri updater 私钥**。以后接入自动更新时再单独设计签名密钥和更新清单，不能直接复用速启的仓库地址。
+- 主程序已接入 Tauri updater。关于页支持检查、下载、安装和重启；Windows 安装版使用 NSIS 更新包，macOS 使用 `.app.tar.gz`，Windows 便携版仅引导手动替换，不得误走 NSIS 安装流程。
+- updater 使用主程序独立 minisign 密钥。仓库 secrets 必须配置 `TAURI_SIGNING_PRIVATE_KEY` 和 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`；本机私钥、公钥和密码位于被忽略的 `.office-toolbox/updater/`，不得复用速启或共享剪贴板密钥。`tauri.conf.json` 只提交公钥，endpoint 固定指向 `duangdangding/my_office_tool` 的 `latest.json`。
+- 发布时各平台通过 `scripts/update-manifest.mjs` 生成清单片段，最终 `latest` job 合并 Windows x64、macOS ARM64／x64 三个平台后上传 `latest.json`。安装包和更新包改名必须同步修改 `.sig` 文件名。
+- Windows 代码签名为可选项。配置仓库 secrets `WINDOWS_CERT_PFX`（PFX 的 base64）和 `WINDOWS_CERT_PASSWORD` 后，CI 会注入 `signCommand` 并调用 `scripts/sign-windows.ps1`；它与 updater 签名不是同一套密钥。
+- macOS 当前仅配置 Apple Silicon／Intel 构建，未签名、未公证；正式公开发布前需要另行配置 Apple Developer ID 签名、公证、staple 和真机验收。minisign 不等于 Apple 签名或公证。
+- 不要把证书、私钥或密码写入仓库、日志或 `tauri.conf.json`，也不要在回复或终端输出私钥和密码。
 - 发布资源必须由 `scripts/prepare-bundled-plugins.mjs` 生成，避免把插件依赖、构建缓存、日志和数据库打进安装包。
 - 当前随包的是插件源码；插件已有可执行文件时优先运行，否则回退到开发命令并需要对应 Bun／Rust 环境。若要求最终用户零开发环境运行，需要另行实现插件预编译产物打包。
 - GitHub 推送默认直连。直连失败时只可临时使用明确指定的代理命令，不要把本机代理写回全局 Git 配置。

@@ -1,1 +1,1 @@
-{"default":{"identifier":"default","description":"办公工具箱主窗口权限","local":true,"windows":["main"],"permissions":["core:default","dialog:default"]}}
+{"default":{"identifier":"default","description":"办公工具箱主窗口权限","local":true,"windows":["main"],"permissions":["core:default","dialog:default","updater:default","updater:allow-check","updater:allow-download","updater:allow-install","process:default","process:allow-restart"]}}

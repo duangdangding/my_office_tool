@@ -22,6 +22,7 @@ export interface PluginManifest {
   category: string;
   icon: string;
   permissions: string[];
+  platforms?: Array<"windows" | "macos">;
   entry: {
     mode: "auto" | "executable" | "dev";
     executable: string[];
@@ -30,14 +31,31 @@ export interface PluginManifest {
   standalone: { instructions: string };
 }
 
+export interface PluginOrigin {
+  type: "local" | "git";
+  localPath?: string;
+  repository?: string;
+}
+
+export interface PluginDirectoryView {
+  path: string;
+  isDefault: boolean;
+}
+
 export interface PluginView {
   manifest: PluginManifest;
   root: string;
   source: PluginSource;
+  origin: PluginOrigin | null;
   rules: PluginRules;
   runtime: {
     status: PluginStatus;
     pid: number | null;
     detail: string | null;
   };
+}
+
+export interface ExtractPluginResult {
+  outputDir: string;
+  files: string[];
 }

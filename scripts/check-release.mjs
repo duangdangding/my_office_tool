@@ -36,4 +36,12 @@ if (tag) {
   }
 }
 
-console.log(`发版检查通过：${Object.keys(versions).length} 处版本均为 ${version}${tag ? `，标签为 ${tag}` : ""}。`);
+const updater = tauriConfig.plugins?.updater;
+if (tauriConfig.bundle?.createUpdaterArtifacts !== true || !updater?.pubkey || !Array.isArray(updater?.endpoints) || updater.endpoints.length === 0) {
+  throw new Error("updater 配置不完整：需要 createUpdaterArtifacts、pubkey 和至少一个 endpoint");
+}
+if (updater.endpoints.some((endpoint) => endpoint !== "https://github.com/duangdangding/my_office_tool/releases/latest/download/latest.json")) {
+  throw new Error("updater endpoint 必须指向主程序仓库的 latest.json，不能复用其他项目的地址");
+}
+
+console.log(`发版检查通过：${Object.keys(versions).length} 处版本均为 ${version}，updater 配置完整${tag ? `，标签为 ${tag}` : ""}。`);

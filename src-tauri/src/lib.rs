@@ -14,6 +14,8 @@ use tauri::{
 
 const MANIFEST_FILE: &str = "office-plugin.json";
 const RULES_FILE: &str = "rules.json";
+const ORIGINS_FILE: &str = "plugin-origins.json";
+const SETTINGS_FILE: &str = "settings.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -59,6 +61,8 @@ struct PluginManifest {
     icon: String,
     #[serde(default)]
     permissions: Vec<String>,
+    #[serde(default)]
+    platforms: Vec<String>,
     entry: PluginEntry,
     standalone: StandaloneInfo,
 }
@@ -118,19 +122,53 @@ impl PluginRuntime {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginOrigin {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    local_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repository: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PluginView {
     manifest: PluginManifest,
     root: String,
     source: String,
+    origin: Option<PluginOrigin>,
     rules: PluginRules,
     runtime: PluginRuntime,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtractPluginResult {
+    output_dir: String,
+    files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginDirectoryView {
+    path: String,
+    is_default: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct StoredSettings {
+    plugin_dir: Option<PathBuf>,
+}
+
 struct AppState {
     data_dir: PathBuf,
+    plugin_dir: Mutex<PathBuf>,
     rules: Mutex<HashMap<String, PluginRules>>,
+    origins: Mutex<HashMap<String, PluginOrigin>>,
     runtimes: Mutex<HashMap<String, PluginRuntime>>,
     running: Mutex<HashMap<String, Child>>,
     detached: Mutex<HashMap<String, Child>>,
@@ -163,6 +201,48 @@ fn save_rules(state: &AppState) -> Result<(), String> {
     let bytes = serde_json::to_vec_pretty(&*rules).map_err(|e| e.to_string())?;
     let target = state.data_dir.join(RULES_FILE);
     fs::write(target, bytes).map_err(|e| format!("保存插件规则失败：{e}"))
+}
+
+fn load_origins(data_dir: &Path) -> HashMap<String, PluginOrigin> {
+    fs::read_to_string(data_dir.join(ORIGINS_FILE))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+fn save_origins(state: &AppState) -> Result<(), String> {
+    fs::create_dir_all(&state.data_dir).map_err(|e| format!("创建配置目录失败：{e}"))?;
+    let origins = state.origins.lock().unwrap();
+    let bytes = serde_json::to_vec_pretty(&*origins).map_err(|e| e.to_string())?;
+    fs::write(state.data_dir.join(ORIGINS_FILE), bytes).map_err(|e| format!("保存插件来源失败：{e}"))
+}
+
+fn load_plugin_dir(data_dir: &Path) -> PathBuf {
+    fs::read_to_string(data_dir.join(SETTINGS_FILE))
+        .ok()
+        .and_then(|text| serde_json::from_str::<StoredSettings>(&text).ok())
+        .and_then(|settings| settings.plugin_dir)
+        .unwrap_or_else(|| data_dir.join("plugins"))
+}
+
+fn plugins_dir(state: &AppState) -> PathBuf {
+    state.plugin_dir.lock().unwrap().clone()
+}
+
+fn plugin_directory_view(state: &AppState) -> PluginDirectoryView {
+    let path = plugins_dir(state);
+    PluginDirectoryView {
+        is_default: path == state.data_dir.join("plugins"),
+        path: path.to_string_lossy().to_string(),
+    }
+}
+
+fn save_plugin_dir(state: &AppState, path: &Path) -> Result<(), String> {
+    fs::create_dir_all(&state.data_dir).map_err(|e| format!("创建配置目录失败：{e}"))?;
+    let default = state.data_dir.join("plugins");
+    let settings = StoredSettings { plugin_dir: (path != default).then(|| path.to_path_buf()) };
+    let bytes = serde_json::to_vec_pretty(&settings).map_err(|e| e.to_string())?;
+    fs::write(state.data_dir.join(SETTINGS_FILE), bytes).map_err(|e| format!("保存插件目录设置失败：{e}"))
 }
 
 fn safe_join(root: &Path, relative: &str) -> Result<PathBuf, String> {
@@ -198,12 +278,23 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<(), String> {
     if manifest.entry.mode == "dev" && manifest.entry.dev.is_none() {
         return Err("dev 模式必须声明开发启动命令".into());
     }
+    for platform in &manifest.platforms {
+        if !matches!(platform.as_str(), "windows" | "macos") {
+            return Err(format!("未知插件平台：{platform}；目前支持 windows、macos"));
+        }
+    }
     for candidate in &manifest.entry.executable {
         safe_join(Path::new(""), candidate)?;
     }
     if let Some(command) = &manifest.entry.dev {
         if command.program.trim().is_empty() {
             return Err("开发启动命令不能为空".into());
+        }
+        safe_join(Path::new(""), &command.cwd)?;
+    }
+    if let Some(command) = &manifest.entry.build {
+        if command.program.trim().is_empty() {
+            return Err("构建命令不能为空".into());
         }
         safe_join(Path::new(""), &command.cwd)?;
     }
@@ -216,6 +307,34 @@ fn read_manifest(root: &Path) -> Result<PluginManifest, String> {
     let manifest: PluginManifest = serde_json::from_str(&text).map_err(|e| format!("插件清单格式错误：{e}"))?;
     validate_manifest(&manifest)?;
     Ok(manifest)
+}
+
+fn current_platform() -> &'static str {
+    #[cfg(target_os = "macos")]
+    return "macos";
+    #[cfg(not(target_os = "macos"))]
+    return "windows";
+}
+
+fn ensure_plugin_compatible(root: &Path, manifest: &PluginManifest) -> Result<(), String> {
+    if !manifest.platforms.is_empty() && !manifest.platforms.iter().any(|platform| platform == current_platform()) {
+        return Err(format!("此插件不支持当前系统（{}），声明支持：{}", current_platform(), manifest.platforms.join("、")));
+    }
+    let has_executable = manifest.entry.executable.iter().any(|candidate| {
+        safe_join(root, candidate).map(|path| path.is_file()).unwrap_or(false)
+    });
+    let has_dev = manifest.entry.dev.as_ref().is_some_and(|command| {
+        safe_join(root, &command.cwd).map(|path| path.is_dir()).unwrap_or(false)
+    });
+    let usable = match manifest.entry.mode.as_str() {
+        "executable" => has_executable,
+        "dev" => has_dev,
+        _ => has_executable || has_dev,
+    };
+    if !usable {
+        return Err("插件与当前环境不兼容：没有可用的已编译程序，且 dev 启动工作目录无效。请提供当前平台的编译产物或有效开发命令".into());
+    }
+    Ok(())
 }
 
 fn set_runtime(state: &AppState, id: &str, runtime: PluginRuntime) -> PluginRuntime {
@@ -314,7 +433,7 @@ fn plugin_roots(app: &AppHandle, state: &AppState) -> Vec<(PathBuf, String)> {
     if let Ok(dir) = app.path().resource_dir() {
         roots.push((dir.join("plugins"), "builtin".into()));
     }
-    roots.push((state.data_dir.join("plugins"), "imported".into()));
+    roots.push((plugins_dir(state), "imported".into()));
 
     let mut seen = HashSet::new();
     roots.retain(|(root, _)| {
@@ -335,11 +454,13 @@ fn discover_plugins(app: &AppHandle, state: &AppState) -> Vec<PluginView> {
             let Ok(manifest) = read_manifest(&path) else { continue };
             if !ids.insert(manifest.id.clone()) { continue }
             let rules = state.rules.lock().unwrap().get(&manifest.id).cloned().unwrap_or_default();
+            let origin = state.origins.lock().unwrap().get(&manifest.id).cloned();
             let runtime = runtime_for(state, &manifest.id);
             plugins.push(PluginView {
                 manifest,
                 root: path.to_string_lossy().to_string(),
                 source: source.clone(),
+                origin,
                 rules,
                 runtime,
             });
@@ -584,26 +705,216 @@ fn list_plugins(app: AppHandle, state: State<'_, AppState>) -> Vec<PluginView> {
 }
 
 #[tauri::command]
+fn get_plugin_directory(state: State<'_, AppState>) -> PluginDirectoryView {
+    plugin_directory_view(&state)
+}
+
+#[tauri::command]
+fn set_plugin_directory(app: AppHandle, state: State<'_, AppState>, path: String) -> Result<PluginDirectoryView, String> {
+    let path = fs::canonicalize(path.trim()).map_err(|e| format!("插件目录不可访问：{e}"))?;
+    if !path.is_dir() {
+        return Err("请选择一个文件夹作为插件目录".into());
+    }
+    if path == plugins_dir(&state) {
+        return Ok(plugin_directory_view(&state));
+    }
+    let imported = discover_plugins(&app, &state).into_iter().filter(|plugin| plugin.source == "imported").collect::<Vec<_>>();
+    if imported.iter().any(|plugin| plugin.runtime.status == "detached") {
+        return Err("请先退出独立运行的导入插件，再切换插件目录".into());
+    }
+    save_plugin_dir(&state, &path)?;
+    for plugin in imported {
+        stop_tracked(&state, &plugin.manifest.id)?;
+    }
+    *state.plugin_dir.lock().unwrap() = path;
+    Ok(plugin_directory_view(&state))
+}
+
+fn copy_declared_executables(manifest: &PluginManifest, source: &Path, target: &Path) -> Result<(), String> {
+    let source = fs::canonicalize(source).map_err(|e| format!("读取插件目录失败：{e}"))?;
+    for candidate in &manifest.entry.executable {
+        let from = safe_join(&source, candidate)?;
+        if !from.is_file() { continue }
+        let canonical = fs::canonicalize(&from).map_err(|e| format!("读取编译产物失败：{e}"))?;
+        if !canonical.starts_with(&source) {
+            return Err(format!("编译产物不能链接到插件目录之外：{candidate}"));
+        }
+        let to = safe_join(target, candidate)?;
+        if let Some(parent) = to.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("创建编译产物目录失败：{e}"))?;
+        }
+        fs::copy(&canonical, &to).map_err(|e| format!("复制编译产物 {} 失败：{e}", canonical.display()))?;
+    }
+    Ok(())
+}
+
+fn install_plugin(app: &AppHandle, state: &AppState, source: &Path, origin: PluginOrigin) -> Result<PluginView, String> {
+    let manifest = read_manifest(source)?;
+    ensure_plugin_compatible(source, &manifest)?;
+    if find_plugin(app, state, &manifest.id).is_ok() {
+        return Err(format!("插件 id「{}」已存在，请先移除旧插件", manifest.id));
+    }
+    let imported_root = plugins_dir(state);
+    let target = imported_root.join(&manifest.id);
+    if source.starts_with(&target) || target.starts_with(source) || target.exists() {
+        return Err("目标插件目录已存在或导入路径无效".into());
+    }
+    fs::create_dir_all(&imported_root).map_err(|e| e.to_string())?;
+    let result = copy_plugin_directory(source, &target)
+        .and_then(|_| copy_declared_executables(&manifest, source, &target));
+    if let Err(error) = result {
+        let _ = fs::remove_dir_all(&target);
+        return Err(error);
+    }
+    state.origins.lock().unwrap().insert(manifest.id.clone(), origin);
+    if let Err(error) = save_origins(state) {
+        state.origins.lock().unwrap().remove(&manifest.id);
+        let _ = fs::remove_dir_all(&target);
+        return Err(error);
+    }
+    find_plugin(app, state, &manifest.id)
+}
+
+fn temporary_path(state: &AppState, prefix: &str) -> Result<PathBuf, String> {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_nanos();
+    Ok(state.data_dir.join("tmp").join(format!("{prefix}-{}-{nonce}", std::process::id())))
+}
+
+fn clone_git_repository(url: &str, checkout: &Path) -> Result<(), String> {
+    if let Some(parent) = checkout.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("创建临时导入目录失败：{e}"))?;
+    }
+    let mut command = Command::new("git");
+    command
+        .args(["clone", "--depth", "1", "--recurse-submodules", "--shallow-submodules", "--"])
+        .arg(url)
+        .arg(checkout)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    hide_console(&mut command);
+    let output = command.output().map_err(|e| format!("无法执行 Git，请先安装并配置 git：{e}"))?;
+    if !output.status.success() {
+        let _ = fs::remove_dir_all(checkout);
+        let detail = String::from_utf8_lossy(&output.stderr);
+        let tail = detail.chars().rev().take(4000).collect::<String>().chars().rev().collect::<String>();
+        return Err(format!("Git 仓库克隆失败：{}", if tail.trim().is_empty() { output.status.to_string() } else { tail.trim().into() }));
+    }
+    Ok(())
+}
+
+fn sanitize_repository_url(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else { return url.into() };
+    let scheme = &url[..scheme_end];
+    if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
+        return url.into();
+    }
+    let remainder = &url[scheme_end + 3..];
+    let authority_end = remainder.find('/').unwrap_or(remainder.len());
+    let authority = &remainder[..authority_end];
+    let Some(at) = authority.rfind('@') else { return url.into() };
+    format!("{scheme}://{}{}", &authority[at + 1..], &remainder[authority_end..])
+}
+
+#[tauri::command]
 fn import_plugin(app: AppHandle, state: State<'_, AppState>, path: String) -> Result<PluginView, String> {
     let source = fs::canonicalize(path.trim()).map_err(|e| format!("插件目录不可访问：{e}"))?;
     if !source.is_dir() {
         return Err("请选择包含 office-plugin.json 的插件目录".into());
     }
-    let manifest = read_manifest(&source)?;
-    if find_plugin(&app, &state, &manifest.id).is_ok() {
-        return Err(format!("插件 id「{}」已存在，请先移除旧插件", manifest.id));
+    let origin = PluginOrigin { kind: "local".into(), local_path: Some(source.to_string_lossy().to_string()), repository: None };
+    install_plugin(&app, &state, &source, origin)
+}
+
+#[tauri::command(async)]
+fn import_git_plugin(app: AppHandle, state: State<'_, AppState>, url: String) -> Result<PluginView, String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err("请输入 Git 仓库地址".into());
     }
-    let imported_root = state.data_dir.join("plugins");
-    let target = imported_root.join(&manifest.id);
-    if source.starts_with(&target) || target.exists() {
-        return Err("目标插件目录已存在或导入路径无效".into());
+    let checkout = temporary_path(&state, "plugin-import")?;
+    clone_git_repository(url, &checkout)?;
+    let origin = PluginOrigin { kind: "git".into(), local_path: None, repository: Some(sanitize_repository_url(url)) };
+    let result = install_plugin(&app, &state, &checkout, origin);
+    let _ = fs::remove_dir_all(&checkout);
+    result
+}
+
+fn replace_plugin_from_source(app: &AppHandle, state: &AppState, plugin: &PluginView, source: &Path) -> Result<PluginView, String> {
+    let manifest = read_manifest(source)?;
+    ensure_plugin_compatible(source, &manifest)?;
+    if manifest.id != plugin.manifest.id {
+        return Err(format!("更新来源的插件 id 为「{}」，与当前插件「{}」不一致", manifest.id, plugin.manifest.id));
     }
-    fs::create_dir_all(&imported_root).map_err(|e| e.to_string())?;
-    if let Err(error) = copy_plugin_directory(&source, &target) {
-        let _ = fs::remove_dir_all(&target);
+    let managed = PathBuf::from(&plugin.root);
+    let canonical_source = fs::canonicalize(source).map_err(|e| format!("更新来源不可访问：{e}"))?;
+    let canonical_managed = fs::canonicalize(&managed).map_err(|e| format!("当前插件目录不可访问：{e}"))?;
+    if canonical_source == canonical_managed || canonical_source.starts_with(&canonical_managed) || canonical_managed.starts_with(&canonical_source) {
+        return Err("更新来源与当前插件目录重叠，已取消更新".into());
+    }
+    let managed_parent = managed.parent().ok_or_else(|| "当前插件目录无效".to_string())?;
+    let staging_root = managed_parent.join(".office-toolbox-tmp");
+    fs::create_dir_all(&staging_root).map_err(|e| format!("创建更新临时目录失败：{e}"))?;
+    let unique = temporary_path(state, "plugin-update")?;
+    let name = unique.file_name().ok_or_else(|| "生成更新临时目录失败".to_string())?;
+    let staging = staging_root.join(name);
+    let backup = staging_root.join(format!("{}-backup", name.to_string_lossy()));
+    let result = copy_plugin_directory(&canonical_source, &staging)
+        .and_then(|_| copy_declared_executables(&manifest, &canonical_source, &staging));
+    if let Err(error) = result {
+        let _ = fs::remove_dir_all(&staging);
         return Err(error);
     }
-    find_plugin(&app, &state, &manifest.id)
+
+    if let Err(error) = stop_tracked(state, &plugin.manifest.id) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+    if let Err(error) = fs::rename(&managed, &backup) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(format!("备份旧插件失败：{error}"));
+    }
+    if let Err(error) = fs::rename(&staging, &managed) {
+        let _ = fs::remove_dir_all(&staging);
+        if let Err(restore_error) = fs::rename(&backup, &managed) {
+            return Err(format!("替换插件失败：{error}；恢复旧版本也失败：{restore_error}。旧版本备份保留在 {}", backup.display()));
+        }
+        return Err(format!("替换插件失败，已恢复旧版本：{error}"));
+    }
+    let _ = fs::remove_dir_all(&backup);
+    set_runtime(state, &plugin.manifest.id, PluginRuntime::new("stopped", None, "插件已更新"));
+    find_plugin(app, state, &plugin.manifest.id)
+}
+
+#[tauri::command(async)]
+fn update_plugin(app: AppHandle, state: State<'_, AppState>, id: String) -> Result<PluginView, String> {
+    let plugin = find_plugin(&app, &state, &id)?;
+    if plugin.source != "imported" {
+        return Err("内置插件随工具箱发布，不能单独更新".into());
+    }
+    if plugin.runtime.status == "detached" {
+        return Err("请先退出独立运行的插件，再执行更新".into());
+    }
+    let origin = plugin.origin.clone().ok_or_else(|| "未记录插件来源，无法更新；请移除后重新导入".to_string())?;
+    match origin.kind.as_str() {
+        "local" => {
+            let source = origin.local_path.as_deref().ok_or_else(|| "本地更新来源记录不完整".to_string())?;
+            replace_plugin_from_source(&app, &state, &plugin, Path::new(source))
+        }
+        "git" => {
+            let repository = origin.repository.as_deref().ok_or_else(|| "未记录 Git 仓库地址，无法更新；请移除后重新导入".to_string())?;
+            let checkout = temporary_path(&state, "plugin-update-checkout")?;
+            clone_git_repository(repository, &checkout)?;
+            let result = replace_plugin_from_source(&app, &state, &plugin, &checkout);
+            let _ = fs::remove_dir_all(&checkout);
+            result
+        }
+        _ => Err("未知插件来源，无法更新".into()),
+    }
 }
 
 #[tauri::command]
@@ -628,17 +939,156 @@ fn stop_plugin(state: State<'_, AppState>, id: String) -> Result<(), String> {
     Ok(())
 }
 
+fn original_source_for_removal(plugin: &PluginView) -> Result<PathBuf, String> {
+    let origin = plugin.origin.as_ref().ok_or_else(|| "未记录此插件的原始本地目录，不能删除原项目".to_string())?;
+    if origin.kind != "local" {
+        return Err("只有本地项目导入的插件支持删除原项目目录".into());
+    }
+    let local_path = origin.local_path.as_deref().ok_or_else(|| "原始本地目录记录不完整".to_string())?;
+    let source = fs::canonicalize(local_path).map_err(|e| format!("原始本地目录不可访问：{e}"))?;
+    let managed = fs::canonicalize(&plugin.root).map_err(|e| format!("插件目录不可访问：{e}"))?;
+    if !source.is_dir() || source.parent().is_none() || source == managed || source.starts_with(&managed) || managed.starts_with(&source) {
+        return Err("原始本地目录不安全，已取消删除".into());
+    }
+    let source_manifest = read_manifest(&source).map_err(|e| format!("无法核对原始项目，已取消删除：{e}"))?;
+    if source_manifest.id != plugin.manifest.id {
+        return Err("原始目录中的插件 id 已变化，已取消删除".into());
+    }
+    Ok(source)
+}
+
 #[tauri::command]
-fn remove_plugin(app: AppHandle, state: State<'_, AppState>, id: String) -> Result<(), String> {
+fn remove_plugin(app: AppHandle, state: State<'_, AppState>, id: String, delete_source: Option<bool>) -> Result<(), String> {
     let plugin = find_plugin(&app, &state, &id)?;
     if plugin.source != "imported" {
         return Err("内置插件只能停用，不能移除".into());
     }
+    let original = delete_source.unwrap_or(false).then(|| original_source_for_removal(&plugin)).transpose()?;
     stop_tracked(&state, &id)?;
     state.detached.lock().unwrap().remove(&id);
     fs::remove_dir_all(&plugin.root).map_err(|e| format!("移除插件失败：{e}"))?;
+    let source_result = original.map_or(Ok(()), |source| {
+        fs::remove_dir_all(&source).map_err(|e| format!("插件已移除，但原始本地目录删除失败：{e}"))
+    });
     state.rules.lock().unwrap().remove(&id);
-    save_rules(&state)
+    state.origins.lock().unwrap().remove(&id);
+    state.runtimes.lock().unwrap().remove(&id);
+    let metadata_result = save_origins(&state).and_then(|_| save_rules(&state));
+    source_result?;
+    metadata_result
+}
+
+fn extract_declared_executables(plugin: &PluginView, destination: &Path) -> Result<ExtractPluginResult, String> {
+    let output_dir = destination.join(format!("{}-compiled", plugin.manifest.id));
+    let mut roots = Vec::new();
+    if let Some(local_path) = plugin.origin.as_ref().and_then(|origin| origin.local_path.as_deref()) {
+        roots.push(PathBuf::from(local_path));
+    }
+    roots.push(PathBuf::from(&plugin.root));
+    let mut files = Vec::new();
+    for candidate in &plugin.manifest.entry.executable {
+        let mut source = None;
+        for root in &roots {
+            let path = safe_join(root, candidate)?;
+            if !path.is_file() { continue }
+            let canonical = fs::canonicalize(&path).map_err(|e| format!("读取编译产物失败：{e}"))?;
+            let canonical_root = fs::canonicalize(root).map_err(|e| format!("读取插件目录失败：{e}"))?;
+            if !canonical.starts_with(&canonical_root) {
+                return Err(format!("编译产物不能链接到插件目录之外：{candidate}"));
+            }
+            source = Some(canonical);
+            break;
+        }
+        let Some(source) = source else { continue };
+        let target = safe_join(&output_dir, candidate)?;
+        let parent = target.parent().ok_or_else(|| "编译产物提取路径无效".to_string())?;
+        fs::create_dir_all(parent).map_err(|e| format!("创建提取目录失败：{e}"))?;
+        let canonical_output = fs::canonicalize(&output_dir).map_err(|e| format!("读取提取目录失败：{e}"))?;
+        let canonical_parent = fs::canonicalize(parent).map_err(|e| format!("读取提取目录失败：{e}"))?;
+        if !canonical_output.starts_with(destination) || !canonical_parent.starts_with(&canonical_output) {
+            return Err("提取目录不能链接到所选位置之外".into());
+        }
+        if fs::symlink_metadata(&target).map(|meta| meta.file_type().is_symlink()).unwrap_or(false) {
+            return Err(format!("提取目标不能是符号链接：{candidate}"));
+        }
+        fs::copy(&source, &target).map_err(|e| format!("提取 {} 失败：{e}", source.display()))?;
+        files.push(candidate.clone());
+    }
+    if files.is_empty() {
+        return Err("未找到清单 entry.executable 声明的编译产物，请先编译插件".into());
+    }
+    Ok(ExtractPluginResult { output_dir: output_dir.to_string_lossy().to_string(), files })
+}
+
+#[tauri::command]
+fn extract_plugin(app: AppHandle, state: State<'_, AppState>, id: String, destination: String) -> Result<ExtractPluginResult, String> {
+    let plugin = find_plugin(&app, &state, &id)?;
+    let destination = fs::canonicalize(destination.trim()).map_err(|e| format!("提取目录不可访问：{e}"))?;
+    if !destination.is_dir() {
+        return Err("请选择一个文件夹作为提取位置".into());
+    }
+    extract_declared_executables(&plugin, &destination)
+}
+
+// ---------- 主程序应用内更新 ----------
+
+/// 区分 Windows 安装版和便携版。只有卸载项明确指向当前 exe 时才按安装版处理，
+/// 避免电脑同时存在安装版时，便携版被错误地更新到另一个目录。
+#[tauri::command]
+fn update_install_kind() -> String {
+    #[cfg(windows)]
+    {
+        use winreg::{enums::*, RegKey};
+
+        let Ok(exe) = std::env::current_exe() else { return "portable".into() };
+        let exe_text = exe.to_string_lossy().to_lowercase();
+        let exe_dir = exe.parent();
+        for hive in [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE] {
+            for name in ["办公工具箱", "office-toolbox", "com.office.toolbox"] {
+                let path = format!("Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{name}");
+                let Ok(key) = RegKey::predef(hive).open_subkey(path) else { continue };
+                let executable_matches = ["DisplayIcon", "UninstallString"].iter().any(|value_name| {
+                    key.get_value::<String, _>(value_name).map(|value| {
+                        let value = value.trim().trim_matches('"').to_lowercase();
+                        value.strip_prefix(&exe_text).is_some_and(|suffix| {
+                            suffix.is_empty() || suffix.starts_with([',', '"', ' ', '\t'])
+                        })
+                    }).unwrap_or(false)
+                });
+                let location_matches = key.get_value::<String, _>("InstallLocation").ok().as_deref().map(Path::new)
+                    .zip(exe_dir)
+                    .is_some_and(|(install_dir, current_dir)| install_dir == current_dir);
+                if executable_matches || location_matches {
+                    return "installed".into();
+                }
+            }
+        }
+        "portable".into()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "macos".into()
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        "installed".into()
+    }
+}
+
+#[tauri::command]
+fn open_release_page() -> Result<(), String> {
+    const RELEASES_URL: &str = "https://github.com/duangdangding/my_office_tool/releases/latest";
+    #[cfg(windows)]
+    let mut command = Command::new("rundll32.exe");
+    #[cfg(windows)]
+    command.arg("url.dll,FileProtocolHandler");
+    #[cfg(target_os = "macos")]
+    let mut command = Command::new("open");
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    let mut command = Command::new("xdg-open");
+    command.arg(RELEASES_URL);
+    hide_console(&mut command);
+    command.spawn().map(|_| ()).map_err(|e| format!("打开发布页面失败：{e}"))
 }
 
 #[tauri::command]
@@ -682,8 +1132,11 @@ fn show_main_window(app: &AppHandle) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let data_dir = default_data_dir();
+    let plugin_dir = load_plugin_dir(&data_dir);
     let state = AppState {
         rules: Mutex::new(load_rules(&data_dir)),
+        origins: Mutex::new(load_origins(&data_dir)),
+        plugin_dir: Mutex::new(plugin_dir),
         data_dir,
         runtimes: Mutex::new(HashMap::new()),
         running: Mutex::new(HashMap::new()),
@@ -691,14 +1144,23 @@ pub fn run() {
     };
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             list_plugins,
+            get_plugin_directory,
+            set_plugin_directory,
             import_plugin,
+            import_git_plugin,
+            update_plugin,
             update_plugin_rules,
             launch_plugin,
             stop_plugin,
             remove_plugin,
+            extract_plugin,
+            update_install_kind,
+            open_release_page,
             open_plugin_directory,
             read_plugin_log,
         ])
@@ -824,6 +1286,7 @@ mod tests {
             manifest,
             root: env!("CARGO_MANIFEST_DIR").into(),
             source: "builtin".into(),
+            origin: None,
             rules: PluginRules::default(),
             runtime: PluginRuntime::stopped(),
         };
@@ -836,7 +1299,9 @@ mod tests {
     fn process_errors_become_persistent_failed_state() {
         let state = AppState {
             data_dir: PathBuf::from("."),
+            plugin_dir: Mutex::new(PathBuf::from(".")),
             rules: Mutex::new(HashMap::new()),
+            origins: Mutex::new(HashMap::new()),
             runtimes: Mutex::new(HashMap::new()),
             running: Mutex::new(HashMap::new()),
             detached: Mutex::new(HashMap::new()),
@@ -844,5 +1309,130 @@ mod tests {
         let runtime = exited_runtime(&state, "demo-tool", Err("编译进程读取失败".into()), true, false);
         assert_eq!(runtime.status, "failed");
         assert_eq!(runtime_for(&state, "demo-tool").detail.as_deref(), Some("编译进程读取失败"));
+    }
+
+    fn test_dir(name: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-data")
+            .join(format!("{name}-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn copies_declared_executable_without_whole_build_cache() {
+        let base = test_dir("copy-executable");
+        let source = base.join("source");
+        let target = base.join("target");
+        let release = source.join("src-tauri").join("target").join("release");
+        fs::create_dir_all(&release).unwrap();
+        fs::write(release.join("demo.exe"), "program").unwrap();
+        fs::write(release.join("cache.obj"), "cache").unwrap();
+        let mut manifest = manifest();
+        manifest.entry.executable = vec!["src-tauri/target/release/demo.exe".into()];
+
+        copy_declared_executables(&manifest, &source, &target).unwrap();
+
+        assert_eq!(fs::read_to_string(target.join("src-tauri/target/release/demo.exe")).unwrap(), "program");
+        assert!(!target.join("src-tauri/target/release/cache.obj").exists());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn extracts_latest_original_executable_with_relative_path() {
+        let base = test_dir("extract-executable");
+        let original = base.join("original");
+        let managed = base.join("managed");
+        let destination = base.join("output");
+        let relative = "src-tauri/target/release/demo.exe";
+        for (root, contents) in [(&original, "new"), (&managed, "old")] {
+            let release = root.join("src-tauri").join("target").join("release");
+            fs::create_dir_all(&release).unwrap();
+            fs::write(release.join("demo.exe"), contents).unwrap();
+        }
+        fs::create_dir_all(&destination).unwrap();
+        let mut manifest = manifest();
+        manifest.entry.executable = vec![relative.into()];
+        let plugin = PluginView {
+            manifest,
+            root: managed.to_string_lossy().to_string(),
+            source: "imported".into(),
+            origin: Some(PluginOrigin { kind: "local".into(), local_path: Some(original.to_string_lossy().to_string()), repository: None }),
+            rules: PluginRules::default(),
+            runtime: PluginRuntime::stopped(),
+        };
+
+        let result = extract_declared_executables(&plugin, &fs::canonicalize(&destination).unwrap()).unwrap();
+
+        assert_eq!(result.files, vec![relative]);
+        assert_eq!(fs::read_to_string(destination.join("demo-tool-compiled").join(relative)).unwrap(), "new");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn refuses_to_delete_original_when_manifest_id_changed() {
+        let base = test_dir("remove-origin");
+        let source = base.join("source");
+        let managed = base.join("managed");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&managed).unwrap();
+        let mut changed = manifest();
+        changed.id = "another-plugin".into();
+        fs::write(source.join(MANIFEST_FILE), serde_json::to_vec_pretty(&changed).unwrap()).unwrap();
+        let plugin = PluginView {
+            manifest: manifest(),
+            root: managed.to_string_lossy().to_string(),
+            source: "imported".into(),
+            origin: Some(PluginOrigin { kind: "local".into(), local_path: Some(source.to_string_lossy().to_string()), repository: None }),
+            rules: PluginRules::default(),
+            runtime: PluginRuntime::stopped(),
+        };
+
+        assert!(original_source_for_removal(&plugin).is_err());
+        assert!(source.exists());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn compatibility_rejects_unsupported_platform_and_missing_entrypoint() {
+        let base = test_dir("compatibility");
+        let mut value = manifest();
+        value.platforms = vec![if current_platform() == "windows" { "macos".into() } else { "windows".into() }];
+        assert!(ensure_plugin_compatible(&base, &value).is_err());
+
+        value.platforms.clear();
+        value.entry.mode = "executable".into();
+        value.entry.executable = vec!["missing.exe".into()];
+        value.entry.dev = None;
+        assert!(ensure_plugin_compatible(&base, &value).is_err());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn git_repository_metadata_does_not_keep_http_userinfo() {
+        assert_eq!(sanitize_repository_url("https://user:secret@example.com/owner/plugin.git"), "https://example.com/owner/plugin.git");
+        assert_eq!(sanitize_repository_url("git@example.com:owner/plugin.git"), "git@example.com:owner/plugin.git");
+    }
+
+    #[test]
+    fn custom_plugin_directory_is_persisted() {
+        let base = test_dir("settings");
+        let custom = base.join("custom-plugins");
+        fs::create_dir_all(&custom).unwrap();
+        let state = AppState {
+            data_dir: base.clone(),
+            plugin_dir: Mutex::new(base.join("plugins")),
+            rules: Mutex::new(HashMap::new()),
+            origins: Mutex::new(HashMap::new()),
+            runtimes: Mutex::new(HashMap::new()),
+            running: Mutex::new(HashMap::new()),
+            detached: Mutex::new(HashMap::new()),
+        };
+
+        save_plugin_dir(&state, &custom).unwrap();
+        assert_eq!(load_plugin_dir(&base), custom);
+        let _ = fs::remove_dir_all(base);
     }
 }
