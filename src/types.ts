@@ -48,7 +48,7 @@ export interface PluginDirectoryView {
   isDefault: boolean;
 }
 
-export type AppTheme = "light" | "dark" | "paper" | "forest" | "ocean" | "sunset";
+export type AppTheme = "system" | "light" | "dark" | "paper" | "forest" | "ocean" | "sunset";
 
 export interface AppSettings {
   launchAtStartup: boolean;

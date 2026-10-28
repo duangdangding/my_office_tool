@@ -57,7 +57,9 @@ let updateDownloaded = 0;
 let updateTotal = 0;
 let pendingImportSession = "";
 
+const systemThemeQuery = window.matchMedia("(prefers-color-scheme: dark)");
 const themes: Array<{ id: AppTheme; label: string; description: string; background: string; accent: string; sidebar: string }> = [
+  { id: "system", label: "跟随系统", description: "自动明暗", background: "linear-gradient(135deg, #f6f7f5 0 50%, #101613 50% 100%)", accent: "#5e8f79", sidebar: "#26322c" },
   { id: "light", label: "浅色", description: "清爽自然", background: "#f6f7f5", accent: "#19785c", sidebar: "#16241f" },
   { id: "dark", label: "深色", description: "低光舒适", background: "#101613", accent: "#72cda4", sidebar: "#0c120f" },
   { id: "paper", label: "纸张", description: "温暖柔和", background: "#f4efe7", accent: "#966737", sidebar: "#29241f" },
@@ -67,11 +69,16 @@ const themes: Array<{ id: AppTheme; label: string; description: string; backgrou
 ];
 
 function applyTheme(theme: AppTheme): void {
-  document.documentElement.dataset.theme = theme;
-  document.documentElement.style.colorScheme = theme === "dark" ? "dark" : "light";
-  const sidebar = themes.find((item) => item.id === theme)?.sidebar ?? themes[0].sidebar;
+  const resolved = theme === "system" ? (systemThemeQuery.matches ? "dark" : "light") : theme;
+  document.documentElement.dataset.theme = resolved;
+  document.documentElement.style.colorScheme = resolved === "dark" ? "dark" : "light";
+  const sidebar = themes.find((item) => item.id === resolved)?.sidebar ?? "#16241f";
   document.querySelector<HTMLMetaElement>('meta[name="theme-color"]')?.setAttribute("content", sidebar);
 }
+
+systemThemeQuery.addEventListener("change", () => {
+  if (settings?.theme === "system") applyTheme("system");
+});
 
 // 仅在界面展示时移除 Windows 扩展路径前缀，保留数据模型中的原始路径。
 const displayText = (value: unknown) => String(value ?? "")

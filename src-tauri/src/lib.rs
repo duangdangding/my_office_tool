@@ -238,6 +238,7 @@ struct PluginDirectoryView {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 enum AppTheme {
+    System,
     #[default]
     Light,
     Dark,
@@ -2313,10 +2314,10 @@ mod tests {
         pending_imports: Mutex::new(HashMap::new()),
         };
 
-        state.settings.lock().unwrap().theme = AppTheme::Ocean;
+        state.settings.lock().unwrap().theme = AppTheme::System;
         save_plugin_dir(&state, &custom).unwrap();
         assert_eq!(load_plugin_dir(&base), custom);
-        assert!(matches!(load_settings(&base).theme, AppTheme::Ocean));
+        assert!(matches!(load_settings(&base).theme, AppTheme::System));
         let _ = fs::remove_dir_all(base);
     }
 
