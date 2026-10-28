@@ -1,0 +1,38 @@
+[package]
+name = "suqi"
+version = "0.16.6"
+description = "速启 - 快捷启动器"
+authors = ["you"]
+edition = "2021"
+
+[lib]
+name = "suqi_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset", "tray-icon", "image-png", "macos-private-api"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-autostart = "2"
+tauri-plugin-process = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-single-instance = "2"
+window-vibrancy = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6"
+sha2 = "0.10"
+rand = "0.8"
+hex = "0.4"
+pinyin = { version = "0.10", default-features = false, features = ["plain"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+tauri-plugin-updater = "2"
+ureq = "2"
+base64 = "0.22"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"

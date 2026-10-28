@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>速启设置</title>
+    <!-- 首屏底色：JS/CSS 加载前先铺主题背景色，避免 WebView 默认白底闪烁（与默认深色主题一致，跟随系统浅色偏好） -->
+    <style>
+      html, body { background: #1e1e2e; }
+      @media (prefers-color-scheme: light) { html, body { background: #f4f4f8; } }
+    </style>
+  </head>
+  <body>
+    <main id="settings">
+      <nav class="tabs">
+        <button class="tab active" data-tab="general">常规</button>
+        <button class="tab" data-tab="appearance">外观</button>
+        <button class="tab" data-tab="data">数据库</button>
+        <button class="tab" data-tab="about">关于</button>
+      </nav>
+
+      <section class="tab-page active" id="tab-general">
+        <div class="field">
+          <label>全局快捷键（呼出/隐藏面板）</label>
+          <div class="row">
+            <button id="hotkey" class="hotkey-btn" type="button">点击录制</button>
+            <button id="hotkey-reset" type="button">恢复默认</button>
+          </div>
+          <small id="hotkey-hint">按下组合键后松开即完成录制（例如 Win+`）</small>
+        </div>
+        <div class="field">
+          <label>面板已显示但被其他窗口盖住时，按快捷键</label>
+          <select id="hotkey-unfocused-behavior">
+            <option value="front">显示到最前面</option>
+            <option value="hide">隐藏面板</option>
+          </select>
+          <small>选「显示到最前面」时，面板已在最前再按快捷键才会隐藏</small>
+        </div>
+        <div class="field">
+          <label>启动</label>
+          <label class="check"><input type="checkbox" id="autostart" /> 开机自启动</label>
+          <label class="check"><input type="checkbox" id="silent-start" /> 静默启动（不显示主面板）</label>
+        </div>
+        <div class="field">
+          <label>面板</label>
+          <label class="check"><input type="checkbox" id="always-on-top" /> 窗口置顶</label>
+          <label class="check"><input type="checkbox" id="remember-size" /> 记住窗口大小</label>
+        </div>
+        <div class="field">
+          <label>搜索</label>
+          <label class="check"><input type="checkbox" id="run-target-enabled" /> 搜索框可当 Win + R 使用（输入 \\路径、命令或网址直接运行）</label>
+          <small>开启后既能搜索启动项，也能直接运行输入的内容；关闭后搜索框仅匹配启动项</small>
+          <label class="check"><input type="checkbox" id="clear-search-on-reopen" /> 重新打开面板时清空搜索框</label>
+        </div>
+        <div class="field">
+          <label>加密分组解锁</label>
+          <select id="encrypt-unlock-mode">
+            <option value="session">只有重启应用才需输入密码</option>
+            <option value="always">每次打开面板都需输入密码</option>
+          </select>
+          <small>选择访问加密分组时要求输入密码的时机</small>
+        </div>
+        <div class="field">
+          <label>配置文件目录</label>
+          <div class="row">
+            <code id="config-dir">加载中…</code>
+            <button id="btn-change-config-dir" type="button">更改…</button>
+            <button id="btn-reset-config-dir" type="button">恢复默认</button>
+          </div>
+          <small id="config-dir-hint">默认在程序目录下，可自定义到其他位置</small>
+        </div>
+      </section>
+
+      <section class="tab-page" id="tab-appearance">
+        <div class="field">
+          <label>主题</label>
+          <select id="theme">
+            <option value="dark">深色</option>
+            <option value="light">浅色</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>高亮颜色</label>
+          <div class="row">
+            <input type="color" id="highlight-color" />
+            <label class="check"><input type="checkbox" id="highlight-follow" /> 跟随主题</label>
+          </div>
+        </div>
+        <div class="field">
+          <label>字号</label>
+          <input type="number" id="font-size" min="10" max="24" step="1" />
+        </div>
+        <div class="field">
+          <label>窗口效果（透明材质）</label>
+          <select id="window-effect">
+            <option value="default">默认（不透明）</option>
+            <option value="acrylic" data-win-only>亚克力</option>
+            <option value="mica" data-win-only>云母</option>
+            <option value="vibrancy">毛玻璃</option>
+          </select>
+          <small>切换后呼出主面板可实时预览</small>
+        </div>
+        <div class="field">
+          <label>面板背景</label>
+          <label class="check"><input type="checkbox" id="bg-enabled" /> 启用面板背景图</label>
+          <div class="row">
+            <button id="bg-pick" type="button">选择图片…</button>
+            <button id="bg-clear" type="button" disabled>清除背景</button>
+          </div>
+          <label class="check"><input type="checkbox" id="bg-apply-settings" /> 同时应用到设置窗口</label>
+          <div id="bg-editor" class="bg-editor-wrap" hidden>
+            <div class="bg-preview">
+              <div class="bg-preview-layer" id="bg-preview-layer"></div>
+              <div class="bg-preview-mock">
+                <div class="bgp-toolbar">
+                  <span class="bgp-search"></span>
+                  <span class="bgp-btn"></span>
+                  <span class="bgp-btn"></span>
+                </div>
+                <div class="bgp-tabs">
+                  <span class="bgp-tab active"></span>
+                  <span class="bgp-tab"></span>
+                  <span class="bgp-tab"></span>
+                  <span class="bgp-tab"></span>
+                </div>
+                <div class="bgp-list">
+                  <div class="bgp-item"><div class="bar"></div><div class="bar short"></div></div>
+                  <div class="bgp-item"><div class="bar"></div><div class="bar short"></div></div>
+                  <div class="bgp-item"><div class="bar"></div><div class="bar short"></div></div>
+                  <div class="bgp-item"><div class="bar"></div><div class="bar short"></div></div>
+                </div>
+                <div class="bgp-footer"><div class="bar"></div></div>
+              </div>
+            </div>
+            <div class="bg-options">
+              <label class="field">填充方式
+                <select id="bg-mode">
+                  <option value="stretch">拉伸（铺满面板）</option>
+                  <option value="tile">平铺（原尺寸重复）</option>
+                </select>
+              </label>
+              <label class="field">背景透明度
+                <div class="bg-slider-row">
+                  <input id="bg-opacity" type="range" min="5" max="100" step="1" />
+                  <span id="bg-opacity-val" class="bg-slider-val">60%</span>
+                </div>
+              </label>
+              <label class="field">图片宽度（占面板百分比）
+                <div class="bg-slider-row">
+                  <input id="bg-scale-w" type="range" min="5" max="300" step="1" />
+                  <span id="bg-scale-w-val" class="bg-slider-val">100%</span>
+                </div>
+              </label>
+              <label class="field">图片高度（占面板百分比）
+                <div class="bg-slider-row">
+                  <input id="bg-scale-h" type="range" min="5" max="300" step="1" />
+                  <span id="bg-scale-h-val" class="bg-slider-val">100%</span>
+                </div>
+              </label>
+              <div class="field">
+                <small style="display:block;margin-bottom:6px">旋转</small>
+                <div class="bg-rotate-row">
+                  <button class="bg-rot" data-rot="0" type="button">0°</button>
+                  <button class="bg-rot" data-rot="90" type="button">90°</button>
+                  <button class="bg-rot" data-rot="180" type="button">180°</button>
+                  <button class="bg-rot" data-rot="270" type="button">270°</button>
+                </div>
+              </div>
+              <div class="field">
+                <div class="row">
+                  <button id="bg-region-toggle" type="button">选择图片区域…</button>
+                  <button id="bg-region-reset" type="button" disabled>重置为整图</button>
+                </div>
+                <div id="bg-region-wrap" hidden>
+                  <div class="bg-region-box" id="bg-region-box">
+                    <img id="bg-region-img" alt="背景源图" />
+                    <div class="bg-region-rect" id="bg-region-rect"></div>
+                  </div>
+                  <small>在图片上按住拖动，框选用作背景的区域；再次点击「选择图片区域…」收起。</small>
+                </div>
+              </div>
+              <div class="row">
+                <button id="bg-apply" type="button">应用背景</button>
+              </div>
+            </div>
+          </div>
+          <small>支持 PNG / JPG / WebP / BMP / GIF，最大 30MB；选择图片后在预览中调整，点「应用背景」后生效</small>
+        </div>
+      </section>
+
+      <section class="tab-page" id="tab-data">
+        <div class="field">
+          <label>数据库目录</label>
+          <div class="row">
+            <code id="db-dir">加载中…</code>
+            <button id="btn-change-db-dir" type="button">更改…</button>
+            <button id="btn-reset-db-dir" type="button">恢复默认</button>
+          </div>
+          <small id="db-dir-hint">数据库文件默认在程序目录下，可自定义到其他位置</small>
+        </div>
+        <div class="field">
+          <label>数据库信息</label>
+          <div class="db-info">
+            <div>路径：<code id="db-path">-</code></div>
+            <div>大小：<span id="db-size">-</span></div>
+            <div>项目数：<span id="db-items">-</span></div>
+            <div>分组数：<span id="db-groups">-</span></div>
+            <div>密码已设置：<span id="db-password">-</span></div>
+          </div>
+          <button id="btn-refresh-db" type="button">刷新</button>
+        </div>
+      </section>
+
+      <section class="tab-page" id="tab-about">
+        <div class="field">
+          <div class="free-notice">
+            <p class="free-notice-title">⭐ 个人免费开源软件</p>
+            <p>速启<strong>永久免费，无任何付费功能</strong>。如果你是花钱获得本软件的，请<strong>直接申请退款</strong>，然后从 <a href="https://github.com/duangdangding/ls_quick_start" target="_blank" rel="noreferrer">GitHub</a> 免费下载正版。</p>
+            <p>觉得好用？欢迎到 <a href="https://github.com/duangdangding/ls_quick_start" target="_blank" rel="noreferrer">GitHub 仓库</a> 点一个 ⭐ <strong>Star</strong>，这是对我持续更新最大的鼓励！</p>
+          </div>
+        </div>
+        <div class="field">
+          <h2>速启</h2>
+          <p id="about-desc">Windows 快捷启动器</p>
+          <div class="db-info">
+            <div>当前版本：<code id="cur-version">-</code></div>
+            <div>最新版本：<code id="latest-version">尚未检查</code></div>
+          </div>
+          <p>
+            <a href="https://github.com/duangdangding/ls_quick_start" target="_blank" rel="noreferrer">GitHub 仓库</a>
+          </p>
+        </div>
+        <div class="field">
+          <label>自动更新</label>
+          <div class="row">
+            <button id="btn-check-update" class="primary" type="button">检查更新</button>
+            <button id="btn-do-update" class="primary" type="button" hidden>下载并安装</button>
+            <button id="btn-do-update-dir" type="button" hidden>下载到其他目录…</button>
+            <button id="btn-relaunch" class="primary" type="button" hidden>重启完成更新</button>
+          </div>
+          <p id="install-kind" hidden></p>
+          <div id="update-progress" class="update-progress" hidden>
+            <div id="update-progress-bar" class="update-progress-bar"></div>
+          </div>
+          <p id="update-status"></p>
+          <p id="update-notes" hidden></p>
+          <label class="check"><input id="auto-check-update" type="checkbox" /> 启动时自动检查更新</label>
+          <small>更新包来自 GitHub Releases，下载后自动安装，无需再手动打开网页下载</small>
+        </div>
+      </section>
+
+      <footer>
+        <button id="btn-save" class="primary" type="button">保存</button>
+        <span id="save-msg"></span>
+      </footer>
+    </main>
+    <script type="module" src="/src/settings.ts"></script>
+  </body>
+</html>

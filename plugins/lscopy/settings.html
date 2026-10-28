@@ -1,0 +1,534 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>设置 - 共享剪贴板-卢</title>
+    <script type="module" src="/src/settings.ts" defer></script>
+  </head>
+
+  <body class="settings-body">
+    <div class="settings-page">
+      <h1>设置</h1>
+
+      <div class="tabs-wrap">
+        <nav class="tabs">
+          <button class="tab active" data-tab="general">常规</button>
+          <button class="tab" data-tab="appearance">外观</button>
+          <button class="tab" data-tab="rules">记录规则</button>
+          <button class="tab" data-tab="lock">安全锁定</button>
+          <button class="tab" data-tab="data">数据管理</button>
+          <button class="tab" data-tab="sync">设备同步</button>
+          <button class="tab" data-tab="about">关于</button>
+        </nav>
+      </div>
+
+      <!-- 常规 -->
+      <div class="tab-panel" id="tab-general">
+        <section class="card">
+          <h2>全局快捷键</h2>
+          <div class="row">
+            <input id="hotkey" type="text" readonly placeholder="点击此处，然后按下组合键" />
+            <button id="hotkey-reset" class="btn">恢复默认 Ctrl+`</button>
+          </div>
+          <p class="desc" id="hotkey-desc">用于呼出/隐藏剪贴板面板，需包含 Ctrl / Shift / Alt / Win 中至少一个修饰键。</p>
+          <div class="row">
+            <label class="field full">设置页已打开但被其他窗口遮挡时，按快捷键：
+              <select id="settings-hotkey-action">
+                <option value="front">把设置窗口显示到最前面</option>
+                <option value="close">关闭设置窗口</option>
+              </select>
+            </label>
+          </div>
+          <p class="desc">仅当设置窗口可见但没有焦点时生效；设置窗口提到最前 / 关闭后，再按快捷键恢复正常的面板呼出与隐藏。</p>
+        </section>
+
+        <section class="card">
+          <h2>剪贴板记录</h2>
+          <label class="check"><input id="enabled" type="checkbox" /> 开启剪贴板记录</label>
+          <p class="desc">关闭后不存储复制的内容；关闭期间复制的内容在重新开启后也不会补录。托盘菜单和弹窗页也可切换。</p>
+        </section>
+
+        <section class="card">
+          <h2>启动</h2>
+          <label class="check"><input id="autostart" type="checkbox" /> 开机自动启动</label>
+          <label class="check"><input id="silent-start" type="checkbox" /> 静默启动（启动时不弹出面板）</label>
+        </section>
+
+        <section class="card">
+          <h2>面板</h2>
+          <label class="check"><input id="remember-size" type="checkbox" /> 记住窗口大小（重启后恢复上次的长宽）</label>
+          <p class="desc">拖动面板右缘 / 下缘 / 右下角可调整大小；开启后调整结果会被记住，下次启动保持不变。</p>
+          <label class="check"><input id="follow-cursor-monitor" type="checkbox" /> 窗口跟随光标所在屏幕</label>
+          <p class="desc">多显示器时，打开面板 / 设置 / 互传文件等所有窗口都显示在光标所在的屏幕上；窗口已在该屏幕时保持当前位置不动，且任何情况下窗口都会被限制在屏幕范围内（不越界）。</p>
+        </section>
+
+        <section class="card">
+          <h2>配置文件</h2>
+          <div class="row">
+            <input id="config-dir" type="text" placeholder="默认：程序所在目录" />
+            <button id="config-dir-browse" class="btn">选择目录…</button>
+            <button id="config-dir-default" class="btn">恢复默认</button>
+          </div>
+          <p class="desc">所有设置（含局域网同步）统一保存在所选目录下的 lscopy-config.json。修改目录时会询问是否把原配置迁移过去。</p>
+        </section>
+      </div>
+
+      <!-- 外观 -->
+      <div class="tab-panel" id="tab-appearance" hidden>
+        <section class="card">
+          <h2>外观</h2>
+          <div class="row">
+            <label class="field">主题
+              <select id="theme">
+                <option value="dark">深色</option>
+                <option value="light">浅色</option>
+              </select>
+            </label>
+            <label class="field">字号
+              <input id="font-size" type="number" min="10" max="24" value="14" />
+            </label>
+            <label class="field">搜索高亮颜色
+              <input id="highlight-color" type="color" value="#89b4fa" />
+            </label>
+            <label class="check hl-follow"><input id="highlight-follow" type="checkbox" checked /> 跟随主题强调色</label>
+          </div>
+          <p class="desc hl-preview">预览：搜索 <code>nh</code> 命中「<mark id="hl-preview-mark">你好</mark>」，改动即时反映在这里；保存后面板内生效。</p>
+          <div class="row">
+            <label class="field">窗口效果（选择后立即生效）
+              <select id="window-effect">
+                <option value="default">默认（不透明）</option>
+                <option value="acrylic">亚克力</option>
+                <option value="vibrancy">苹果毛玻璃</option>
+                <option value="mica">云母（Windows 11）</option>
+              </select>
+            </label>
+          </div>
+          <p class="desc">各窗口的材质效果：亚克力 / 云母仅 Windows 支持（云母需 Windows 11），macOS 上统一呈现为系统毛玻璃。选择后自动弹出主面板预览。</p>
+          <label class="field full">字体（点击展开系统字体列表）
+            <div class="font-picker">
+              <input id="font-family" type="text" readonly placeholder="点击选择字体..." />
+              <div id="font-dropdown" class="font-dropdown">
+                <input id="font-search" class="font-search" type="text" placeholder="搜索字体..." autocomplete="off" />
+                <div id="font-list"></div>
+              </div>
+            </div>
+          </label>
+        </section>
+
+        <section class="card">
+          <h2>面板背景</h2>
+          <label class="check"><input id="bg-enabled" type="checkbox" /> 启用面板背景图（覆盖工具栏与列表区域）</label>
+          <div class="row" style="margin-top: 8px">
+            <button id="bg-pick" class="btn">选择图片…</button>
+            <button id="bg-clear" class="btn danger" disabled>清除背景</button>
+          </div>
+          <div class="row" style="gap: 16px; margin-top: 8px">
+            <label class="check"><input id="bg-apply-settings" type="checkbox" /> 同时应用到设置窗口</label>
+            <label class="check"><input id="bg-apply-transfer" type="checkbox" /> 同时应用到互传文件窗口</label>
+          </div>
+          <div id="bg-editor" class="bg-editor-wrap" hidden>
+            <!-- 预览：模拟主面板（工具栏 + 标签 + 列表 + 底栏），背景层实时套用当前选项 -->
+            <div class="bg-preview">
+              <div class="bg-preview-layer" id="bg-preview-layer"></div>
+              <div class="bg-preview-mock">
+                <div class="bgp-toolbar">
+                  <span class="bgp-switch"></span>
+                  <span class="bgp-search"></span>
+                  <span class="bgp-btn"></span>
+                  <span class="bgp-btn"></span>
+                </div>
+                <div class="bgp-tabs">
+                  <span class="bgp-tab active"></span>
+                  <span class="bgp-tab"></span>
+                  <span class="bgp-tab"></span>
+                  <span class="bgp-tab"></span>
+                </div>
+                <div class="bgp-list">
+                  <div class="bgp-item"><div class="bar"></div><div class="bar short"></div></div>
+                  <div class="bgp-item"><div class="bar"></div><div class="bar short"></div></div>
+                  <div class="bgp-item"><div class="bar"></div><div class="bar short"></div></div>
+                  <div class="bgp-item"><div class="bar"></div><div class="bar short"></div></div>
+                </div>
+                <div class="bgp-footer"><div class="bar"></div></div>
+              </div>
+            </div>
+            <div class="bg-options">
+              <label class="field">填充方式
+                <select id="bg-mode">
+                  <option value="stretch">拉伸（铺满面板）</option>
+                  <option value="tile">平铺（原尺寸重复）</option>
+                </select>
+              </label>
+              <label class="field">背景透明度
+                <div class="bg-slider-row">
+                  <input id="bg-opacity" type="range" min="5" max="100" step="1" />
+                  <span id="bg-opacity-val" class="bg-slider-val">60%</span>
+                </div>
+              </label>
+              <label class="field">图片宽度（占面板百分比）
+                <div class="bg-slider-row">
+                  <input id="bg-scale-w" type="range" min="5" max="300" step="1" />
+                  <span id="bg-scale-w-val" class="bg-slider-val">100%</span>
+                </div>
+              </label>
+              <label class="field">图片高度（占面板百分比）
+                <div class="bg-slider-row">
+                  <input id="bg-scale-h" type="range" min="5" max="300" step="1" />
+                  <span id="bg-scale-h-val" class="bg-slider-val">100%</span>
+                </div>
+              </label>
+              <div class="field">
+                <span class="desc" style="display:block;margin-bottom:6px">旋转</span>
+                <div class="bg-rotate-row">
+                  <button class="btn small bg-rot" data-rot="0">0°</button>
+                  <button class="btn small bg-rot" data-rot="90">90°</button>
+                  <button class="btn small bg-rot" data-rot="180">180°</button>
+                  <button class="btn small bg-rot" data-rot="270">270°</button>
+                </div>
+              </div>
+              <div class="field">
+                <div class="row">
+                  <button id="bg-region-toggle" class="btn">选择图片区域…</button>
+                  <button id="bg-region-reset" class="btn small" disabled>重置为整图</button>
+                </div>
+                <div id="bg-region-wrap" hidden>
+                  <div class="bg-region-box" id="bg-region-box">
+                    <img id="bg-region-img" alt="背景源图" />
+                    <div class="bg-region-rect" id="bg-region-rect"></div>
+                  </div>
+                  <p class="desc">在图片上按住拖动，框选用作背景的区域；再次点击「选择图片区域…」收起。</p>
+                </div>
+              </div>
+              <div class="row" style="margin-top: 6px">
+                <button id="bg-apply" class="btn primary">应用背景</button>
+              </div>
+            </div>
+          </div>
+          <p class="desc">选择图片后在上方预览中实时调整：拉伸/平铺、图片宽高百分比、框选区域、透明度、旋转；点「应用背景」后立即生效。勾选后背景可同时应用到设置窗口与互传文件窗口。平铺模式下宽高百分比决定每块重复单元的大小。动图只取第一帧；与窗口材质同时开启时背景图优先显示。</p>
+        </section>
+      </div>
+
+      <!-- 记录规则 -->
+      <div class="tab-panel" id="tab-rules" hidden>
+        <section class="card">
+          <h2>记录规则</h2>
+          <label class="field">最多保留条数（0 = 无限制；超出后自动删除最旧的非置顶记录）
+            <input id="max-items" type="number" min="0" max="100000" />
+          </label>
+          <label class="field">数据保留时长（0 = 永久保留，到期自动删除，置顶不受影响）
+            <div class="row inline-row">
+              <input id="retention-value" type="number" min="0" max="9999" />
+              <select id="retention-unit">
+                <option value="hours">小时</option>
+                <option value="days">天</option>
+                <option value="months">月</option>
+                <option value="years">年</option>
+              </select>
+            </div>
+          </label>
+          <label class="field full">不记录以下程序中的复制（每行一个 exe 名，例如 KeePass.exe）
+            <textarea id="exclude-apps" rows="4" placeholder="KeePass.exe&#10;1Password.exe"></textarea>
+          </label>
+        </section>
+      </div>
+
+      <!-- 安全锁定 -->
+      <div class="tab-panel" id="tab-lock" hidden>
+        <section class="card">
+          <h2>锁定方式</h2>
+          <div class="row" style="gap: 16px">
+            <label class="check"><input type="radio" name="lock-mode" value="off" checked /> 关闭</label>
+            <label class="check"><input type="radio" name="lock-mode" value="password" /> 密码锁定</label>
+            <label class="check"><input type="radio" name="lock-mode" value="shortcut" /> 快捷键锁定</label>
+          </div>
+          <p class="desc">锁定后所有窗口（面板 / 设置 / 黑名单 / 互传文件）被锁定界面覆盖，需解锁才能继续使用。本页所有设置即时生效，无需点击保存。</p>
+
+          <!-- 密码模式 -->
+          <div id="lock-password-area" hidden>
+            <div class="row" id="lock-old-password-row" hidden>
+              <input id="lock-old-password" type="password" placeholder="当前密码" autocomplete="off" />
+            </div>
+            <div class="row">
+              <input id="lock-new-password" type="password" placeholder="新密码（至少 4 位）" autocomplete="new-password" />
+              <input id="lock-new-password2" type="password" placeholder="确认新密码" autocomplete="new-password" />
+            </div>
+            <div class="row" style="margin-top: 8px">
+              <button id="lock-password-save" class="btn primary">设置密码</button>
+            </div>
+            <p class="desc">密码以加盐迭代哈希保存，不存明文。</p>
+          </div>
+
+          <!-- 快捷键模式 -->
+          <div id="lock-shortcut-area" hidden>
+            <div class="row" id="lock-old-password-row2" hidden>
+              <input id="lock-old-password-sc" type="password" placeholder="当前密码（从密码模式切换时验证）" autocomplete="off" />
+            </div>
+            <div class="row">
+              <input id="lock-shortcut" type="text" readonly placeholder="点击此处，然后按下组合键" />
+              <button id="lock-shortcut-save" class="btn primary">保存快捷键</button>
+            </div>
+            <p class="desc" id="lock-shortcut-desc">解锁组合键需同时按住至少两个修饰键（Ctrl / Shift / Alt / Win）加一个普通键，例如 Ctrl+Shift+K。</p>
+          </div>
+
+          <!-- 关闭锁定：需验证当前密码 / 组合键 -->
+          <div id="lock-disable-area" hidden>
+            <div class="row" id="lock-disable-password-row">
+              <input id="lock-disable-password" type="password" placeholder="输入当前密码以关闭锁定" autocomplete="off" />
+            </div>
+            <div class="row" id="lock-disable-shortcut-row" hidden>
+              <input id="lock-disable-shortcut" type="text" readonly placeholder="点击此处，按下当前解锁组合键" />
+            </div>
+            <div class="row" style="margin-top: 8px">
+              <button id="lock-disable-confirm" class="btn danger">验证并关闭锁定</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="card">
+          <h2>自动锁定</h2>
+          <div class="row" style="align-items: center">
+            <span class="desc">解锁后</span>
+            <input id="lock-auto-minutes" type="number" min="0" max="1440" style="width: 80px" />
+            <span class="desc">分钟自动锁定（0 = 不自动锁定）</span>
+            <button id="lock-auto-save" class="btn small">保存</button>
+          </div>
+        </section>
+
+        <section class="card">
+          <h2>手动锁定</h2>
+          <div class="row">
+            <button id="lock-now" class="btn">立即锁定</button>
+            <span class="desc" style="align-self: center">也可使用托盘菜单「立即锁定」</span>
+          </div>
+          <p class="desc">忘记密码 / 快捷键时，可在锁定界面点「忘记密码 / 快捷键？」重置清空锁定设置（剪贴板记录不受影响）。</p>
+        </section>
+      </div>
+
+      <!-- 数据管理（数据库 + 删除管理） -->
+      <div class="tab-panel" id="tab-data" hidden>        <section class="card">
+          <h2>数据库</h2>
+          <div class="row">
+            <input id="db-dir" type="text" placeholder="默认：程序所在目录" />
+            <button id="db-browse" class="btn">选择目录…</button>
+            <button id="db-default" class="btn">恢复默认</button>
+          </div>
+          <p class="desc">数据库文件为所选目录下的 lscopy.db。切换目录后将使用新目录下的库，旧库文件保留不删除。</p>
+          <div class="row">
+            <button id="btn-export" class="btn">导出记录…</button>
+            <button id="btn-import" class="btn">导入记录…</button>
+          </div>
+        </section>
+
+        <section class="card">
+          <h2>数据库信息 <button id="db-info-refresh" class="btn small">刷新</button></h2>
+          <div id="db-info" class="db-info">加载中…</div>
+        </section>
+
+        <section class="card">
+          <h2>批量删除</h2>
+          <div class="row">
+            <button class="btn" data-range="1h">最近 1 小时</button>
+            <button class="btn" data-range="today">今天</button>
+            <button class="btn" data-range="7d">最近 7 天</button>
+            <button class="btn" data-range="30d">最近 30 天</button>
+            <button class="btn danger" data-range="all">清空全部</button>
+          </div>
+          <p class="desc">范围内有置顶记录时会先询问：连同置顶一起删除 / 只删除非置顶 / 取消。</p>
+        </section>
+
+        <section class="card">
+          <h2>按时间区间删除</h2>
+          <label class="field">开始时间
+            <input id="del-start" type="datetime-local" step="1" />
+          </label>
+          <label class="field">结束时间
+            <input id="del-end" type="datetime-local" step="1" />
+          </label>
+          <div class="row">
+            <button id="btn-del-between" class="btn danger">删除该区间记录</button>
+          </div>
+          <p class="desc" id="del-result"></p>
+        </section>
+      </div>
+
+      <!-- 局域网同步 -->
+      <div class="tab-panel" id="tab-sync" hidden>
+        <section class="card">
+          <h2>同步开关</h2>
+          <label class="check"><input id="lan-discoverable" type="checkbox" /> 可被其他设备发现（广播本机信息）</label>
+          <label class="check"><input id="lan-sharing" type="checkbox" /> 共享剪贴板（允许已配对设备拉取本机内容）</label>
+          <label class="check"><input id="lan-encrypt" type="checkbox" /> 加密传输（共享内容加密发送，对方需为新版 lscopy）</label>
+          <label class="check"><input id="lan-auto-sync" type="checkbox" /> 自动同步（定时拉取已配对设备的新内容）</label>
+          <span class="lan-inline" style="margin-left: 24px">
+            <span class="desc">同步间隔</span>
+            <input id="lan-sync-interval" type="number" min="5" max="3600" style="width: 70px" />
+            <span class="desc">秒（5–3600，默认 30）</span>
+          </span>
+          <label class="check"><input id="lan-auto-accept" type="checkbox" /> 自动同意配对请求（开启后其他设备无需输入配对码即可配对）</label>
+          <p class="desc">与安卓端「共享剪贴板」及其他电脑互通。所有开关即时生效，无需点击保存。</p>
+        </section>
+
+        <section class="card">
+          <h2>本机信息</h2>
+          <div class="lan-info-grid">
+            <span class="lan-label">本机 IP</span>
+            <code id="lan-ip" class="lan-value">获取中…</code>
+
+            <span class="lan-label">服务状态</span>
+            <span id="lan-server-status" class="lan-value">…</span>
+
+            <span class="lan-label">配对码</span>
+            <span class="lan-inline">
+              <code id="lan-token" class="lan-token">…</code>
+              <button id="lan-token-regen" class="btn small">重新生成</button>
+            </span>
+
+            <span class="lan-label">设备名称</span>
+            <span class="lan-inline">
+              <input id="lan-name" type="text" />
+              <button id="lan-name-save" class="btn small">改名</button>
+            </span>
+
+            <span class="lan-label">服务端口</span>
+            <span class="lan-inline">
+              <input id="lan-port" type="number" min="1024" max="65535" />
+              <button id="lan-port-save" class="btn small">应用</button>
+            </span>
+          </div>
+        </section>
+
+        <section class="card">
+          <h2>同步选项</h2>
+          <div class="lan-info-grid">
+            <span class="lan-label">文件存储路径</span>
+            <span class="lan-inline">
+              <input id="lan-dl-dir" type="text" placeholder="留空则仅同步文字" style="width: 240px" />
+              <button id="lan-dl-dir-browse" class="btn small">浏览</button>
+              <button id="lan-dl-dir-save" class="btn small">保存</button>
+              <button id="lan-dl-dir-clear" class="btn small">清空</button>
+            </span>
+
+            <span class="lan-label">文件大小上限</span>
+            <span class="lan-inline">
+              <input id="lan-max-file" type="number" min="1" max="1024" style="width: 70px" />
+              <span class="desc">MB，超过大小的文件不会同步</span>
+            </span>
+          </div>
+          <p class="desc" style="margin: 10px 0 4px">同步类型</p>
+          <div class="row" style="gap: 16px">
+            <label class="check"><input id="lan-sync-text" type="checkbox" /> 文字</label>
+            <label class="check"><input id="lan-sync-image" type="checkbox" /> 图片</label>
+            <label class="check"><input id="lan-sync-media" type="checkbox" /> 影视（视频/音频）</label>
+            <label class="check"><input id="lan-sync-other" type="checkbox" /> 其他文件</label>
+          </div>
+          <p class="desc">同步下载的图片/文件统一存到「文件存储路径」；未设置路径时仅同步文字，同步后会提示。</p>
+        </section>
+
+        <section class="card">
+          <h2>设备 <button id="lan-refresh" class="btn small">刷新</button>
+            <button id="lan-sweep" class="btn small">深度扫描</button>
+            <button id="lan-open-transfer" class="btn small">互传文件</button>
+            <button id="lan-open-blocked" class="btn small">黑名单</button></h2>
+          <div class="row">
+            <input id="lan-manual-ip" type="text" placeholder="手动添加设备 IP，如 192.168.1.8" />
+            <button id="lan-add-ip" class="btn">添加</button>
+          </div>
+          <div id="lan-devices" class="lan-list"><p class="desc">未发现设备。请确认对方已开启「可被发现」，或手动添加 IP。</p></div>
+        </section>
+
+        <!-- 云端中继 -->
+        <section class="card">
+          <h2>中继服务</h2>
+          <label class="check"><input id="relay-enabled" type="checkbox" /> 启用云端中继（设备不在同一局域网时也能同步剪贴板）</label>
+          <div class="lan-info-grid">
+            <span class="lan-label">服务器地址</span>
+            <span class="lan-inline">
+              <input id="relay-url" type="text" placeholder="如 1.2.3.4:8780 或 wss://relay.example.com" style="width: 260px" />
+            </span>
+
+            <span class="lan-label">分组 ID</span>
+            <span class="lan-inline">
+              <input id="relay-group" type="text" placeholder="同一分组的设备互相同步，如 my-family" style="width: 260px" />
+            </span>
+
+            <span class="lan-label">接入密钥</span>
+            <span class="lan-inline">
+              <input id="relay-key" type="password" placeholder="服务器 RELAY_ACCESS_KEYS 之一" style="width: 260px" />
+            </span>
+
+            <span class="lan-label">分组密钥</span>
+            <span class="lan-inline">
+              <input id="relay-gkey" type="password" placeholder="可选：同组设备填相同密钥即启用端到端加密" style="width: 260px" />
+            </span>
+          </div>
+          <label class="check" style="margin-top: 8px"><input id="relay-image" type="checkbox" /> 图片也经中继同步（≤4MB，默认关闭以省服务器流量）</label>
+          <div class="row" style="margin-top: 10px">
+            <button id="relay-save" class="btn">保存并连接</button>
+            <span id="relay-status" class="desc" style="align-self: center">…</span>
+          </div>
+          <p class="desc">接入密钥通过挑战-响应鉴权，从不上线传输。分组密钥仅存在各设备本地，填写后剪贴板内容以 AES-256-GCM 加密后才发出，中继服务器只能看到密文；同组设备必须填写完全相同的分组密钥，否则互相无法解密。文件类仍仅走局域网；在线设备并入上方设备列表（带「云端」徽标）。</p>
+        </section>
+      </div>
+
+      <!-- 关于 / 版本更新 -->
+      <div class="tab-panel" id="tab-about" hidden>
+        <section class="card">
+          <h2>版本更新</h2>
+          <div class="lan-info-grid">
+            <span class="lan-label">当前版本</span>
+            <span class="lan-value" id="cur-version">…</span>
+
+            <span class="lan-label">最新版本</span>
+            <span class="lan-value" id="latest-version">尚未检查</span>
+          </div>
+          <div class="row" style="margin-top: 12px">
+            <button id="btn-check-update" class="btn">检查更新</button>
+            <button id="btn-do-update" class="btn primary" hidden>下载并安装</button>
+            <button id="btn-do-update-dir" class="btn" hidden>下载到其他目录…</button>
+            <button id="btn-relaunch" class="btn primary" hidden>重启完成更新</button>
+          </div>
+          <p class="desc" id="install-kind" hidden></p>
+          <div id="update-progress" class="update-progress" hidden>
+            <div id="update-progress-bar" class="update-progress-bar"></div>
+          </div>
+          <p class="desc" id="update-status"></p>
+          <p class="desc" id="update-notes" hidden></p>
+          <label class="check"><input id="auto-check-update" type="checkbox" /> 启动时自动检查更新</label>
+          <p class="desc">更新来自 GitHub Releases，下载后自动安装，无需再手动打开网页下载。</p>
+        </section>
+
+        <section class="card">
+          <h2>关于</h2>
+          <p class="desc">共享剪贴板-卢（lscopy）：Windows / macOS 桌面共享剪贴板管理工具，支持历史记录、局域网多设备同步与互传文件。</p>
+          <div
+            class="desc"
+            style="
+              border: 1px solid var(--accent, #4a9eff);
+              border-radius: 8px;
+              padding: 10px 12px;
+              margin: 12px 0;
+              background: rgba(74, 158, 255, 0.08);
+              font-weight: 600;
+            "
+          >
+            ⭐ 本软件为个人开源软件，永久免费！<br />
+            如果你是花钱买到的，说明你被骗了 —— 请直接向卖家申请退款，并到 GitHub 仓库举报。<br />
+            觉得好用的话，欢迎到 GitHub 点个 Star ⭐ 支持一下作者！
+          </div>
+          <div class="row">
+            <button id="btn-open-repo" class="btn">电脑版仓库</button>
+            <button id="btn-open-repo-android" class="btn">手机版仓库（安卓）</button>
+            <button id="btn-open-star" class="btn primary">⭐ 去 GitHub 点个 Star</button>
+          </div>
+        </section>
+      </div>
+
+      <footer class="settings-footer">
+        <span id="save-msg" class="save-msg"></span>
+        <button id="btn-save" class="btn primary">保存设置</button>
+      </footer>
+    </div>
+  </body>
+</html>

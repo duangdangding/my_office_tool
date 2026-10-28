@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "id": "suqi",
+  "name": "速启",
+  "version": "0.16.6",
+  "description": "用全局热键快速启动应用、文件、网址和命令，支持分组、拼音搜索与桌面扫描。",
+  "author": "duangdangding",
+  "category": "效率启动",
+  "icon": "rocket",
+  "permissions": ["globalShortcut", "fileSystem", "process", "autostart"],
+  "entry": {
+    "mode": "auto",
+    "executable": [
+      "src-tauri/target/release/suqi.exe",
+      "src-tauri/target/debug/suqi.exe"
+    ],
+    "dev": {
+      "program": "bun",
+      "args": ["run", "tauri", "dev"],
+      "cwd": "."
+    },
+    "build": {
+      "program": "bun",
+      "args": ["run", "tauri", "build"],
+      "cwd": "."
+    }
+  },
+  "standalone": {
+    "instructions": "在此目录执行 bun install，然后执行 bun run tauri dev；发布时使用 bun run tauri build。"
+  }
+}

@@ -1,0 +1,3971 @@
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use arboard::Clipboard;
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
+use tauri::{
+    menu::{CheckMenuItem, Menu, MenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    AppHandle, Emitter, Manager, State, WindowEvent,
+};
+use tauri_plugin_autostart::ManagerExt as AutostartManagerExt;
+use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
+use tauri_plugin_opener::OpenerExt;
+
+mod lan;
+mod lock;
+mod office_plugin;
+mod relay;
+
+// macOS 的 NSPasteboard 不是线程安全的：后台线程读写会与应用主线程（WebKit 周期性
+// 轮询 changeCount）竞争，导致内存损坏闪退（tauri-plugins-workspace#3205）。
+// 进程内所有 arboard 读写统一走这把锁串行化；mac 上写操作还会调度到主线程执行。
+static CLIPBOARD_LOCK: Mutex<()> = Mutex::new(());
+
+// ---------- 配置 ----------
+
+/// 面板背景图设置：选区 / 旋转在设置页用 canvas 烘焙进缓存图（lscopy-bg.png），
+/// 运行时主面板只按 mode + opacity 用 CSS 应用缓存图
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
+pub struct BackgroundConfig {
+    pub enabled: bool,   // 是否启用面板背景图
+    pub mode: String,    // "stretch" 拉伸铺满 | "tile" 原尺寸平铺
+    pub opacity: f64,    // 背景图不透明度 0.05 - 1.0
+    pub scale_w: f64,    // 图片宽度占面板百分比 5 - 300（100 = 与面板同宽）
+    pub scale_h: f64,    // 图片高度占面板百分比 5 - 300（100 = 与面板同高）
+    pub apply_settings: bool, // 背景同时应用到设置窗口
+    pub apply_transfer: bool, // 背景同时应用到互传文件窗口
+    pub rotation: i32,   // 旋转角度（0/90/180/270，烘焙进缓存图）
+    pub region: Option<BgRegion>, // 归一化选区（基于旋转后的源图），None = 整图
+    pub has_image: bool, // 是否已选择图片（源图已入库）
+}
+
+/// 背景图选区：归一化坐标（0-1），相对于旋转后的源图
+#[derive(Serialize, Deserialize, Clone, Copy)]
+#[serde(default)]
+pub struct BgRegion {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
+impl Default for BackgroundConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: "stretch".into(),
+            opacity: 0.6,
+            scale_w: 100.0,
+            scale_h: 100.0,
+            apply_settings: false,
+            apply_transfer: false,
+            rotation: 0,
+            region: None,
+            has_image: false,
+        }
+    }
+}
+
+impl Default for BgRegion {
+    fn default() -> Self {
+        Self { x: 0.0, y: 0.0, w: 1.0, h: 1.0 }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
+pub struct AppConfig {
+    pub hotkey: String,          // 例如 "Ctrl+`" / "Ctrl+Shift+V"
+    pub autostart: bool,         // 开机自启
+    pub silent_start: bool,      // 静默启动（不弹主窗口）
+    pub db_dir: Option<String>,  // 数据库目录；None = 启动文件所在目录
+    pub config_dir: Option<String>, // 配置文件目录；None = 启动文件所在目录
+    pub theme: String,           // "dark" | "light"
+    pub font_family: String,
+    pub font_size: u32,
+    pub exclude_apps: Vec<String>, // 不记录这些程序里的复制（exe 名，小写）
+    pub max_items: i64,          // 最多保留条数（不含置顶），0 = 无限制
+    pub retention_value: u32,    // 数据保留时长数值，0 = 永久保留
+    pub retention_unit: String,  // "hours" | "days" | "months" | "years"
+    pub enabled: bool,           // 是否开启剪贴板记录
+    pub remember_size: bool,     // 记住窗口大小（重启后恢复上次长宽）
+    pub window_width: u32,       // 记住的窗口宽度（逻辑像素，DPI 无关）
+    pub window_height: u32,      // 记住的窗口高度（逻辑像素，DPI 无关）
+    pub follow_cursor_monitor: bool, // 多显示器：打开窗口时跟随光标所在屏幕
+    // 设置窗口已打开且被其他窗口遮挡（可见但未聚焦）时按快捷键的行为：
+    // "front" = 把设置窗口显示到最前面并聚焦；"close" = 关闭（隐藏）设置窗口
+    pub settings_hotkey_action: String,
+    pub window_effect: String,       // 主面板窗口材质："default" | "acrylic" | "vibrancy" | "mica"
+    pub background: BackgroundConfig, // 面板背景图设置
+    pub highlight_color: String,     // 搜索命中高亮颜色（#rrggbb）；空 = 跟随主题强调色
+}
+
+/// 默认全局快捷键：全平台统一 Ctrl+`（mac 上即 Control+`）
+fn default_hotkey() -> String {
+    "Ctrl+`".into()
+}
+
+/// 快捷键显示形式：mac 上把修饰键转成符号（⌃⇧⌥⌘），其他平台原样返回
+fn format_hotkey_display(hk: &str) -> String {
+    if !cfg!(target_os = "macos") {
+        return hk.to_string();
+    }
+    hk.split('+')
+        .map(|p| match p.trim().to_lowercase().as_str() {
+            "ctrl" | "control" => "⌃".to_string(),
+            "shift" => "⇧".to_string(),
+            "alt" | "option" => "⌥".to_string(),
+            "win" | "cmd" | "command" | "super" | "meta" => "⌘".to_string(),
+            _ => p.trim().to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            hotkey: default_hotkey(),
+            autostart: false,
+            silent_start: true,
+            db_dir: None,
+            config_dir: None,
+            theme: "dark".into(),
+            font_family: "Segoe UI, Microsoft YaHei, system-ui, sans-serif".into(),
+            font_size: 14,
+            exclude_apps: vec![],
+            max_items: 0,
+            retention_value: 0,
+            retention_unit: "days".into(),
+            enabled: true,
+            remember_size: false,
+            window_width: 420,
+            window_height: 640,
+            follow_cursor_monitor: true,
+            settings_hotkey_action: "front".into(),
+            window_effect: "default".into(),
+            background: BackgroundConfig::default(),
+            highlight_color: String::new(),
+        }
+    }
+}
+
+/// 合并后的配置文件结构：通用设置 + 局域网同步设置 + 云端中继设置 + 安全锁定设置保存在同一个 JSON
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
+struct ConfigFile {
+    app: AppConfig,
+    lan: lan::LanSettings,
+    relay: relay::RelaySettings,
+    lock: lock::LockSettings,
+}
+
+/// 配置文件目录指针文件：内容是配置文件所在目录（空 = 默认数据目录）。
+/// 放在 default_data_dir()（mac 上不能放 .app 包内——更新会整体替换 bundle，
+/// 包内文件全部丢失，且改写包内容会破坏代码签名）
+fn config_pointer_file() -> PathBuf {
+    default_data_dir().join("lscopy-config-dir.txt")
+}
+
+/// 读取目录指针：优先新位置，兼容 exe 同目录的旧指针（仅迁移过渡期有用；
+/// mac 更新后旧 bundle 已整体被替换，旧指针随之消失，需重新设置一次）
+fn read_config_pointer() -> Option<String> {
+    let read = |p: PathBuf| {
+        std::fs::read_to_string(p)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    read(config_pointer_file()).or_else(|| read(exe_dir().join("lscopy-config-dir.txt")))
+}
+
+/// 当前生效的配置文件路径（读指针文件决定目录）
+fn current_config_file() -> PathBuf {
+    let dir = read_config_pointer()
+        .map(PathBuf::from)
+        .unwrap_or_else(default_data_dir);
+    dir.join("lscopy-config.json")
+}
+
+/// 按配置里的 config_dir 计算配置文件路径
+fn effective_config_file(cfg: &AppConfig) -> PathBuf {
+    cfg.config_dir
+        .as_ref()
+        .map(|d| d.trim())
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(default_data_dir)
+        .join("lscopy-config.json")
+}
+
+/// 解析配置文件文本为（通用设置, 局域网设置, 中继设置, 锁定设置）。
+/// 兼容旧格式：扁平的 AppConfig JSON（局域网设置再从旧 lscopy-lan.json 读）。
+fn load_config_full(
+    raw: Option<&str>,
+) -> (AppConfig, lan::LanSettings, relay::RelaySettings, lock::LockSettings) {
+    if let Some(text) = raw {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
+            if v.get("app").is_some() || v.get("lan").is_some() || v.get("relay").is_some() {
+                // 新格式：{ "app": {...}, "lan": {...}, "relay": {...}, "lock": {...} }（各字段缺失时按默认值填充）
+                if let Ok(mut cf) = serde_json::from_value::<ConfigFile>(v) {
+                    cf.lan = lan::parse_settings(
+                        serde_json::to_string(&cf.lan).ok().as_deref(),
+                    );
+                    return (cf.app, cf.lan, cf.relay, cf.lock);
+                }
+            } else {
+                // 旧格式：整个文件就是 AppConfig
+                let app: AppConfig = serde_json::from_value(v).unwrap_or_default();
+                let old_lan = exe_dir().join("lscopy-lan.json");
+                let lan_raw = std::fs::read_to_string(&old_lan).ok();
+                return (
+                    app,
+                    lan::parse_settings(lan_raw.as_deref()),
+                    relay::RelaySettings::default(),
+                    lock::LockSettings::default(),
+                );
+            }
+        }
+    }
+    (
+        AppConfig::default(),
+        lan::parse_settings(None),
+        relay::RelaySettings::default(),
+        lock::LockSettings::default(),
+    )
+}
+
+/// 把「通用设置 + 局域网设置 + 中继设置 + 锁定设置」合并写入配置文件。
+/// 锁顺序固定：config → lan.settings → relay.settings → lock → config_file，各调用点不得反向加锁。
+pub(crate) fn persist_config(state: &AppState) -> Result<(), String> {
+    let app = state.config.lock().unwrap().clone();
+    let lan = state.lan.settings.lock().unwrap().clone();
+    let relay = state.relay.settings.lock().unwrap().clone();
+    let lock = state.lock.lock().unwrap().clone();
+    let path = state.config_file.lock().unwrap().clone();
+    let cf = ConfigFile { app, lan, relay, lock };
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let json = serde_json::to_string_pretty(&cf).map_err(|e| e.to_string())?;
+    std::fs::write(&path, &json).map_err(|e| e.to_string())?;
+    // 镜像一份到默认数据目录：macOS 更新会整体替换 .app，若配置目录被更新抹掉
+    // （如自定义目录选在包内），下次启动可从镜像恢复上次配置（含数据库/配置文件
+    // 目录设置），不用重新配置
+    let mirror = default_data_dir().join("lscopy-config.json");
+    if mirror != path {
+        if let Some(dir) = mirror.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&mirror, &json);
+    }
+    Ok(())
+}
+
+// ---------- 数据模型 ----------
+
+// 视频文件扩展名（kind=file 时按第一个文件路径的扩展名归类）
+const VIDEO_EXTS: &[&str] = &[
+    "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "mpg", "mpeg", "ts", "m2ts",
+    "rmvb", "rm", "3gp", "f4v", "vob",
+];
+
+// 办公/文本类文件扩展名
+const OFFICE_EXTS: &[&str] = &[
+    "txt", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "csv", "pdf", "md", "rtf", "wps",
+    "et", "dps", "odt", "ods", "odp",
+];
+
+// 记录分类："text" 纯文本 | "image" 图片 | "video" 视频文件 | "office" 办公/文本文件 | "file" 其他文件
+// 文件类记录按第一个文件路径的扩展名归类（与预览显示的第一个文件一致）
+fn category_of(kind: &str, content: Option<&str>) -> &'static str {
+    match kind {
+        "text" => "text",
+        "image" => "image",
+        "file" => {
+            let first = content
+                .unwrap_or("")
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("");
+            let ext = first
+                .rsplit(['\\', '/'])
+                .next()
+                .and_then(|name| name.rsplit_once('.'))
+                .map(|(_, e)| e.to_lowercase())
+                .unwrap_or_default();
+            if VIDEO_EXTS.contains(&ext.as_str()) {
+                "video"
+            } else if OFFICE_EXTS.contains(&ext.as_str()) {
+                "office"
+            } else {
+                "file"
+            }
+        }
+        _ => "file",
+    }
+}
+
+#[derive(Serialize, Clone)]
+struct Clip {
+    id: i64,
+    kind: String,              // "text" | "image" | "file"
+    category: String,          // "text" | "image" | "video" | "office" | "file"
+    preview: String,           // 文字截断预览 / "[图片 WxH]" / "📄 文件名"
+    image_b64: Option<String>, // 图片的 PNG base64
+    url: Option<String>,       // 内容中的第一个网址
+    pinned: bool,
+    created_at: i64,           // 秒级时间戳
+    match_ranges: Vec<(u32, u32)>, // 搜索命中区间（码点索引，左闭右开），前端高亮用；无搜索词时为空
+}
+
+// 提取文本中的第一个 http(s) 网址
+fn first_url(text: &str) -> Option<String> {
+    let mut best: Option<(usize, usize)> = None; // (起始位置, 协议长度)
+    for pat in ["https://", "http://"] {
+        if let Some(pos) = text.find(pat) {
+            if best.map_or(true, |(b, _)| pos < b) {
+                best = Some((pos, pat.len()));
+            }
+        }
+    }
+    let (pos, _) = best?;
+    let rest = &text[pos..];
+    let end = rest
+        .find(|c: char| {
+            c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | ')' | ']' | '）' | '】')
+        })
+        .unwrap_or(rest.len());
+    let url = rest[..end].trim_end_matches(['.', ',', ';', '!', '?', '。', '，', '；']);
+    if url.len() > 8 {
+        Some(url.to_string())
+    } else {
+        None
+    }
+}
+
+#[derive(Serialize)]
+struct DbInfo {
+    path: String,
+    file_size: u64,
+    total: i64,
+    text_count: i64,
+    image_count: i64,
+    pinned_count: i64,
+    max_items: i64,
+}
+
+// macOS：面板弹出瞬间记录的前台 App（pid + bundle id），见 AppState.prev_front_app
+#[cfg(target_os = "macos")]
+#[derive(Clone, Default)]
+struct FrontApp {
+    pid: Option<i32>,
+    bundle: Option<String>,
+}
+
+struct AppState {
+    pub(crate) db: Mutex<Connection>,
+    pub(crate) config: Mutex<AppConfig>,
+    config_file: Mutex<PathBuf>,
+    // 已删除/被排除内容的哈希集合：命中即跳过，直到有新内容入库后清空
+    ignored_hashes: Mutex<Vec<u64>>,
+    // 监听线程已处理过的剪贴板内容哈希，避免轮询重复处理同一内容
+    last_seen: Mutex<u64>,
+    // 托盘「开启记录」勾选项，用于跨界面同步勾选状态
+    tray_toggle: Mutex<Option<tauri::menu::CheckMenuItem<tauri::Wry>>>,
+    // 托盘「立即锁定」菜单项（未启用锁定时置灰）
+    tray_lock: Mutex<Option<tauri::menu::MenuItem<tauri::Wry>>>,
+    // 安全锁定设置（密码哈希/解锁组合键/自动锁定分钟），随配置文件 "lock" 键落盘
+    pub(crate) lock: Mutex<lock::LockSettings>,
+    // 当前是否处于锁定状态（true 时各窗口被锁定遮罩覆盖）
+    pub(crate) locked: AtomicBool,
+    // 上次解锁（或启动）时刻（秒）：自动锁定计时的起点
+    unlock_epoch: Mutex<i64>,
+    // 粘贴防抖：连点时合并为一次粘贴
+    paste_pending: Mutex<bool>,
+    paste_running: AtomicBool,
+    // 本次粘贴是否为「粘贴文件」模式：文件模式下剪贴板写入 CF_HDROP / 文件 URL，
+    // mac 上粘贴到访达是合法操作（等于复制进该文件夹），不做访达拦截
+    paste_file_mode: Mutex<bool>,
+    // 面板弹出前的前台窗口，粘贴后把焦点还给它
+    prev_hwnd: Mutex<isize>,
+    // macOS：面板弹出瞬间记录的前台 App（pid + bundle id）。
+    // 粘贴时显式 open -b 激活回来——不依赖 NSApplication.hide 的「上一个 App」推断
+    // （该推断经常错误地把访达激活到最前，⌘V 会打进访达生成「文本剪贴」文件）
+    #[cfg(target_os = "macos")]
+    prev_front_app: Mutex<FrontApp>,
+    // 面板钉住状态：钉住后失焦/粘贴都不自动隐藏（会话内有效，不持久化）
+    panel_pinned: AtomicBool,
+    // 拖动/缩放进行中：系统模态拖动会造成瞬时失焦，此时不自动隐藏
+    dragging: AtomicBool,
+    // 主窗口当前是否有焦点（失焦延迟复查用）
+    main_focused: AtomicBool,
+    // 调整后待落盘的窗口尺寸（Resize 事件频繁，由监听线程统一保存）
+    pending_size: Mutex<Option<(u32, u32)>>,
+    // 局域网同步模块共享状态
+    pub(crate) lan: lan::LanShared,
+    // 云端中继模块共享状态
+    pub(crate) relay: relay::RelayShared,
+}
+
+pub(crate) fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+pub(crate) fn hash_bytes(data: &[u8]) -> u64 {
+    let mut h = DefaultHasher::new();
+    data.hash(&mut h);
+    h.finish()
+}
+
+// ---------- 拼音检索列（搜索支持全拼 / 首拼） ----------
+
+// 为文本内容生成拼音检索串：
+// - full：中文字符转无声调全拼（如「你好」→ nihao），非中文字符原样小写保留，跨边界可连续匹配
+// - abbr：中文字符取拼音首字母（如「你好」→ nh），非中文字符同样原样小写
+// 多音字取第一个读音；超过 3000 字的部分不索引（搜索词通常远短于此，避免超大文本拖慢入库）
+const PINYIN_INDEX_MAX_CHARS: usize = 3000;
+
+pub(crate) fn pinyin_strings(text: &str) -> (String, String) {
+    use pinyin::ToPinyin;
+    let mut full = String::new();
+    let mut abbr = String::new();
+    for ch in text.chars().take(PINYIN_INDEX_MAX_CHARS) {
+        match ch.to_pinyin() {
+            Some(py) => {
+                let p = py.plain();
+                full.push_str(p);
+                if let Some(c) = p.chars().next() {
+                    abbr.push(c);
+                }
+            }
+            None => {
+                let c = ch.to_ascii_lowercase();
+                full.push(c);
+                abbr.push(c);
+            }
+        }
+    }
+    (full, abbr)
+}
+
+// 老库迁移：为已有文本记录回填拼音检索列
+fn backfill_pinyin(conn: &Connection) {
+    let rows: Vec<(i64, String)> = conn
+        .prepare("SELECT id, content FROM clips WHERE content IS NOT NULL AND pinyin_full IS NULL")
+        .and_then(|mut s| {
+            let mapped = s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            Ok(mapped.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
+    for (id, content) in rows {
+        let (full, abbr) = pinyin_strings(&content);
+        let _ = conn.execute(
+            "UPDATE clips SET pinyin_full = ?2, pinyin_abbr = ?3 WHERE id = ?1",
+            params![id, full, abbr],
+        );
+    }
+}
+
+// 搜索命中区间（字符/码点索引，左闭右开），供前端高亮：
+// 1. 优先取关键词在预览文本中的直接命中（不区分大小写，标出所有出现位置）；
+// 2. 无直接命中且关键词为纯 ASCII 字母数字时回退拼音匹配——把命中在拼音串中的
+//    字节位置映射回预览字符区间（命中半个音节按整字高亮；全拼优先于首拼）
+fn match_ranges(preview: &str, keyword: &str) -> Vec<(u32, u32)> {
+    use pinyin::ToPinyin;
+    let kw = keyword.trim().to_lowercase();
+    if kw.is_empty() {
+        return vec![];
+    }
+    // 直接命中（可能多处；码点索引与前端 Array.from 的口径一致）
+    let lower = preview.to_lowercase();
+    let kw_chars = kw.chars().count() as u32;
+    let mut ranges: Vec<(u32, u32)> = Vec::new();
+    let mut start = 0usize;
+    while let Some(pos) = lower[start..].find(&kw) {
+        let b0 = start + pos;
+        let c0 = lower[..b0].chars().count() as u32;
+        ranges.push((c0, c0 + kw_chars));
+        start = b0 + kw.len();
+        if ranges.len() >= 50 {
+            break;
+        }
+    }
+    if !ranges.is_empty() {
+        return ranges;
+    }
+    // 关键词含中文/符号时拼音串不可能命中，跳过逐字转换
+    if !kw.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return vec![];
+    }
+    // 逐字生成全拼/首拼，并记录每个字符的全拼在串中的字节边界
+    let mut full = String::new();
+    let mut abbr = String::new();
+    let mut bounds: Vec<usize> = Vec::new();
+    for ch in preview.chars() {
+        bounds.push(full.len());
+        match ch.to_pinyin() {
+            Some(py) => {
+                let p = py.plain();
+                full.push_str(p);
+                if let Some(c) = p.chars().next() {
+                    abbr.push(c);
+                }
+            }
+            None => {
+                let c = ch.to_ascii_lowercase();
+                full.push(c);
+                abbr.push(c);
+            }
+        }
+    }
+    bounds.push(full.len());
+    if let Some(pos) = full.find(&kw) {
+        let end = pos + kw.len();
+        let c0 = bounds.partition_point(|&b| b <= pos) - 1;
+        let c1 = bounds.partition_point(|&b| b < end); // b <= end-1 ⟺ b < end
+        return vec![(c0 as u32, c1 as u32)];
+    }
+    if let Some(pos) = abbr.find(&kw) {
+        // 首拼串每个源字符恰好贡献 1 个字符（非 ASCII 字符按 chars 计数换算）
+        let c0 = abbr[..pos].chars().count() as u32;
+        return vec![(c0, c0 + kw_chars)];
+    }
+    vec![]
+}
+
+// 软件所在目录（Windows 便携模式的默认数据位置）
+pub(crate) fn exe_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// 默认数据目录（配置文件/数据库/目录指针的缺省位置）。
+/// Windows 保持便携模式 = exe 同目录；macOS 的 .app 会被更新整体替换，
+/// 包内数据（含目录指针）每次更新都会丢，故缺省放 Application Support。
+pub(crate) fn default_data_dir() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = dirs::home_dir() {
+            return home
+                .join("Library")
+                .join("Application Support")
+                .join("com.lsh.lscopy");
+        }
+    }
+    exe_dir()
+}
+
+fn effective_db_path(cfg: &AppConfig) -> PathBuf {
+    let dir = match &cfg.db_dir {
+        Some(d) if !d.trim().is_empty() => PathBuf::from(d),
+        _ => default_data_dir(),
+    };
+    dir.join("lscopy.db")
+}
+
+fn init_db(path: &PathBuf) -> Result<Connection, String> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let conn = Connection::open(path).map_err(|e| e.to_string())?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS clips (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,
+            content TEXT,
+            image BLOB,
+            width INTEGER,
+            height INTEGER,
+            pinned INTEGER NOT NULL DEFAULT 0,
+            hash INTEGER,
+            created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_clips_time ON clips(created_at DESC);
+        CREATE TABLE IF NOT EXISTS transfers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            direction TEXT NOT NULL,
+            peer TEXT NOT NULL,
+            file_name TEXT NOT NULL,
+            path TEXT,
+            size INTEGER NOT NULL DEFAULT 0,
+            ok INTEGER NOT NULL DEFAULT 0,
+            msg TEXT,
+            created_at INTEGER NOT NULL
+        );",
+    )
+    .map_err(|e| e.to_string())?;
+    // 旧版本库迁移：补 pinned 列
+    if conn.prepare("SELECT pinned FROM clips LIMIT 1").is_err() {
+        conn.execute_batch("ALTER TABLE clips ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
+            .map_err(|e| e.to_string())?;
+    }
+    // 旧版本库迁移：补 hash 列并回填已有数据（必须在建 hash 索引之前）
+    if conn.prepare("SELECT hash FROM clips LIMIT 1").is_err() {
+        conn.execute_batch("ALTER TABLE clips ADD COLUMN hash INTEGER")
+            .map_err(|e| e.to_string())?;
+        backfill_hashes(&conn);
+    }
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_clips_hash ON clips(hash);")
+        .map_err(|e| e.to_string())?;
+    // 旧版本库迁移：局域网同步来源追踪（环回防护用）
+    if conn.prepare("SELECT remote_device_id FROM clips LIMIT 1").is_err() {
+        conn.execute_batch(
+            "ALTER TABLE clips ADD COLUMN remote_device_id TEXT;
+             ALTER TABLE clips ADD COLUMN remote_id INTEGER;",
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    // 旧版本库迁移：拼音检索列（搜索支持全拼/首拼），补列后回填已有文本记录
+    if conn.prepare("SELECT pinyin_full FROM clips LIMIT 1").is_err() {
+        conn.execute_batch(
+            "ALTER TABLE clips ADD COLUMN pinyin_full TEXT;
+             ALTER TABLE clips ADD COLUMN pinyin_abbr TEXT;",
+        )
+        .map_err(|e| e.to_string())?;
+        backfill_pinyin(&conn);
+    }
+    Ok(conn)
+}
+
+// 为旧数据回填内容哈希（用于去重）
+fn backfill_hashes(conn: &Connection) {
+    let rows: Vec<(i64, Option<String>, Option<Vec<u8>>)> = conn
+        .prepare("SELECT id, content, image FROM clips WHERE hash IS NULL")
+        .and_then(|mut s| {
+            let mapped = s.query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?;
+            Ok(mapped.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
+    for (id, content, image) in rows {
+        let h = match (&content, &image) {
+            (Some(t), _) => hash_bytes(t.as_bytes()),
+            (None, Some(b)) => hash_bytes(b),
+            _ => continue,
+        };
+        let _ = conn.execute(
+            "UPDATE clips SET hash = ?1 WHERE id = ?2",
+            params![h as i64, id],
+        );
+    }
+}
+
+// 写入记录：相同内容已存在时仅把时间更新为现在（移到最前），不重复插入
+// 返回 true 表示列表需要刷新
+fn store_clip(
+    db: &Connection,
+    kind: &str,
+    content: Option<&str>,
+    image: Option<&[u8]>,
+    width: Option<u32>,
+    height: Option<u32>,
+    hash: u64,
+) -> bool {
+    let h64 = hash as i64;
+    if let Ok(id) = db.query_row(
+        "SELECT id FROM clips WHERE hash = ?1 ORDER BY created_at DESC LIMIT 1",
+        params![h64],
+        |r| r.get::<_, i64>(0),
+    ) {
+        let _ = db.execute(
+            "UPDATE clips SET created_at = ?2 WHERE id = ?1",
+            params![id, now_secs()],
+        );
+        return true;
+    }
+    let (py_full, py_abbr) = content.map(pinyin_strings).unwrap_or_default();
+    db.execute(
+        "INSERT INTO clips(kind, content, image, width, height, hash, created_at, pinyin_full, pinyin_abbr)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![kind, content, image, width, height, h64, now_secs(), py_full, py_abbr],
+    )
+    .is_ok()
+}
+
+// 超出上限时删除最旧的非置顶记录
+fn prune(db: &Connection, max_items: i64) {
+    if max_items <= 0 {
+        return;
+    }
+    let _ = db.execute(
+        "DELETE FROM clips WHERE pinned = 0 AND id NOT IN (
+            SELECT id FROM clips WHERE pinned = 0 ORDER BY created_at DESC, id DESC LIMIT ?1
+        )",
+        params![max_items],
+    );
+}
+
+// 数据保留时长：计算截止时间戳，0 = 永久保留（None）
+fn retention_cutoff(cfg: &AppConfig) -> Option<i64> {
+    if cfg.retention_value == 0 {
+        return None;
+    }
+    let v = cfg.retention_value as i64;
+    let secs = match cfg.retention_unit.as_str() {
+        "hours" => v * 3600,
+        "months" => v * 30 * 86400,
+        "years" => v * 365 * 86400,
+        _ => v * 86400, // days
+    };
+    Some(now_secs() - secs)
+}
+
+// 删除超过保留时长的非置顶记录
+fn apply_retention(db: &Connection, cfg: &AppConfig) {
+    if let Some(cutoff) = retention_cutoff(cfg) {
+        let _ = db.execute(
+            "DELETE FROM clips WHERE pinned = 0 AND created_at < ?1",
+            params![cutoff],
+        );
+    }
+}
+
+// ---------- 剪贴板监听 ----------
+
+fn png_from_arboard(img: &arboard::ImageData) -> Option<(Vec<u8>, u32, u32)> {
+    let rgba = image::RgbaImage::from_raw(img.width as u32, img.height as u32, img.bytes.to_vec())?;
+    encode_png(rgba)
+}
+
+pub(crate) fn encode_png(rgba: image::RgbaImage) -> Option<(Vec<u8>, u32, u32)> {
+    let w = rgba.width();
+    let h = rgba.height();
+    let mut buf = std::io::Cursor::new(Vec::new());
+    rgba.write_to(&mut buf, image::ImageFormat::Png).ok()?;
+    Some((buf.into_inner(), w, h))
+}
+
+#[cfg(target_family = "windows")]
+fn foreground_exe_name() -> Option<String> {
+    use std::os::windows::ffi::OsStringExt;
+    type Hwnd = *mut std::ffi::c_void;
+    extern "system" {
+        fn GetForegroundWindow() -> Hwnd;
+        fn GetWindowThreadProcessId(hwnd: Hwnd, pid: *mut u32) -> u32;
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> Hwnd;
+        fn QueryFullProcessImageNameW(h: Hwnd, flags: u32, buf: *mut u16, size: *mut u32) -> i32;
+        fn CloseHandle(h: Hwnd) -> i32;
+    }
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_null() {
+            return None;
+        }
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        if pid == 0 {
+            return None;
+        }
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return None;
+        }
+        let mut buf = [0u16; 260];
+        let mut size: u32 = 260;
+        let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut size);
+        CloseHandle(h);
+        if ok == 0 {
+            return None;
+        }
+        let path = std::ffi::OsString::from_wide(&buf[..size as usize]);
+        let s = path.to_string_lossy().to_string();
+        let name = s.rsplit('\\').next().unwrap_or(&s).to_lowercase();
+        Some(name)
+    }
+}
+
+#[cfg(not(target_family = "windows"))]
+fn foreground_exe_name() -> Option<String> {
+    None
+}
+
+// 读取剪贴板中的文件列表（资源管理器里复制的文件/文件夹，CF_HDROP）
+#[cfg(target_family = "windows")]
+fn clipboard_files() -> Option<Vec<String>> {
+    use std::os::windows::ffi::OsStringExt;
+    const CF_HDROP: u32 = 15;
+    type Handle = *mut std::ffi::c_void;
+    extern "system" {
+        fn OpenClipboard(hwnd: Handle) -> i32;
+        fn CloseClipboard() -> i32;
+        fn GetClipboardData(fmt: u32) -> Handle;
+        fn IsClipboardFormatAvailable(fmt: u32) -> i32;
+        fn DragQueryFileW(hdrop: Handle, idx: u32, buf: *mut u16, len: u32) -> u32;
+        fn GlobalLock(h: Handle) -> Handle;
+        fn GlobalUnlock(h: Handle) -> i32;
+    }
+    unsafe {
+        if IsClipboardFormatAvailable(CF_HDROP) == 0 {
+            return None;
+        }
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            return None;
+        }
+        let mut result = Vec::new();
+        let h = GetClipboardData(CF_HDROP);
+        if !h.is_null() {
+            let hdrop = GlobalLock(h);
+            if !hdrop.is_null() {
+                let count = DragQueryFileW(hdrop, 0xFFFFFFFF, std::ptr::null_mut(), 0);
+                for i in 0..count {
+                    let len = DragQueryFileW(hdrop, i, std::ptr::null_mut(), 0);
+                    let mut buf = vec![0u16; (len + 1) as usize];
+                    let got = DragQueryFileW(hdrop, i, buf.as_mut_ptr(), len + 1);
+                    if got > 0 {
+                        buf.truncate(got as usize);
+                        result.push(std::ffi::OsString::from_wide(&buf).to_string_lossy().to_string());
+                    }
+                }
+                GlobalUnlock(h);
+            }
+        }
+        CloseClipboard();
+        if result.is_empty() {
+            None
+        } else {
+            Some(result)
+        }
+    }
+}
+
+// macOS：访达拷贝的文件列表（NSFilenamesPboardType，与现代 file URL 类型由系统自动互转）
+#[cfg(target_os = "macos")]
+fn clipboard_files() -> Option<Vec<String>> {
+    mac_front::copied_files()
+}
+
+#[cfg(not(any(target_family = "windows", target_os = "macos")))]
+fn clipboard_files() -> Option<Vec<String>> {
+    None
+}
+
+// ---------- 把文件列表写入剪贴板（「粘贴文件」） ----------
+// 同时写入文件格式与纯文本格式（路径，\n 分隔）：目标 App 自动挑它能处理的格式——
+// 聊天发送框/资源管理器拿到文件，文本框拿到完整路径，天然实现「粘贴不成功就粘贴地址」，
+// 无需检测粘贴结果。文本用 \n 分隔与库内 content 一致，监听线程读回时哈希命中
+// 原文件记录（仅更新时间戳），不会多出一条纯文本重复记录。
+
+// Windows：CF_HDROP（DROPFILES 头 + 双 \0 结尾宽字符路径列表）+ CF_UNICODETEXT
+#[cfg(target_family = "windows")]
+fn set_clipboard_files_platform(paths: &[String], text: &str) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    type Handle = *mut std::ffi::c_void;
+    extern "system" {
+        fn OpenClipboard(hwnd: Handle) -> i32;
+        fn CloseClipboard() -> i32;
+        fn EmptyClipboard() -> i32;
+        fn SetClipboardData(fmt: u32, h: Handle) -> Handle;
+        fn GlobalAlloc(flags: u32, bytes: usize) -> Handle;
+        fn GlobalLock(h: Handle) -> Handle;
+        fn GlobalUnlock(h: Handle) -> i32;
+        fn GlobalFree(h: Handle) -> Handle;
+    }
+    const GMEM_MOVEABLE: u32 = 0x0002;
+    const CF_UNICODETEXT: u32 = 13;
+    const CF_HDROP: u32 = 15;
+    // DROPFILES 结构固定 20 字节：pFiles(DWORD) + pt(POINT) + fNC(BOOL) + fWide(BOOL)
+    const DROPFILES_SIZE: usize = 20;
+    unsafe {
+        // 剪贴板可能被其他程序短暂占用，重试几次
+        let mut opened = false;
+        for _ in 0..10 {
+            if OpenClipboard(std::ptr::null_mut()) != 0 {
+                opened = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if !opened {
+            return Err("打开剪贴板失败（被其他程序占用）".to_string());
+        }
+        let result = (|| -> Result<(), String> {
+            if EmptyClipboard() == 0 {
+                return Err("清空剪贴板失败".to_string());
+            }
+            // ---- CF_HDROP ----
+            let mut wide: Vec<u16> = Vec::new();
+            for p in paths {
+                wide.extend(std::ffi::OsStr::new(p).encode_wide());
+                wide.push(0);
+            }
+            wide.push(0); // 列表以双 \0 结束
+            let total = DROPFILES_SIZE + wide.len() * 2;
+            let h = GlobalAlloc(GMEM_MOVEABLE, total);
+            if h.is_null() {
+                return Err("GlobalAlloc(CF_HDROP) 失败".to_string());
+            }
+            let p = GlobalLock(h);
+            if p.is_null() {
+                GlobalFree(h);
+                return Err("GlobalLock(CF_HDROP) 失败".to_string());
+            }
+            std::ptr::write_bytes(p as *mut u8, 0, total);
+            *(p as *mut u32) = DROPFILES_SIZE as u32; // pFiles：路径列表偏移
+            *((p as *mut u8).add(16) as *mut u32) = 1; // fWide = TRUE
+            std::ptr::copy_nonoverlapping(
+                wide.as_ptr(),
+                (p as *mut u8).add(DROPFILES_SIZE) as *mut u16,
+                wide.len(),
+            );
+            GlobalUnlock(h);
+            // SetClipboardData 成功后句柄归系统所有，不能再释放
+            if SetClipboardData(CF_HDROP, h).is_null() {
+                GlobalFree(h);
+                return Err("SetClipboardData(CF_HDROP) 失败".to_string());
+            }
+            // ---- CF_UNICODETEXT（纯文本兜底）：失败仅忽略，文件格式已可用 ----
+            let mut wtext: Vec<u16> = std::ffi::OsStr::new(text).encode_wide().collect();
+            wtext.push(0);
+            let ht = GlobalAlloc(GMEM_MOVEABLE, wtext.len() * 2);
+            if !ht.is_null() {
+                let pt = GlobalLock(ht);
+                if !pt.is_null() {
+                    std::ptr::copy_nonoverlapping(wtext.as_ptr(), pt as *mut u16, wtext.len());
+                    GlobalUnlock(ht);
+                    if SetClipboardData(CF_UNICODETEXT, ht).is_null() {
+                        GlobalFree(ht);
+                    }
+                } else {
+                    GlobalFree(ht);
+                }
+            }
+            Ok(())
+        })();
+        CloseClipboard();
+        result
+    }
+}
+
+// macOS：NSPasteboard 同时声明 NSFilenamesPboardType + NSStringPboardType
+#[cfg(target_os = "macos")]
+fn set_clipboard_files_platform(paths: &[String], text: &str) -> Result<(), String> {
+    if mac_front::set_files(paths, text) {
+        Ok(())
+    } else {
+        Err("写入 NSPasteboard 失败".to_string())
+    }
+}
+
+#[cfg(not(any(target_family = "windows", target_os = "macos")))]
+fn set_clipboard_files_platform(_paths: &[String], _text: &str) -> Result<(), String> {
+    Err("当前平台不支持粘贴文件".to_string())
+}
+
+// 写文件到剪贴板的安全入口：与 set_clipboard_by_id_safe 同理，
+// 持 CLIPBOARD_LOCK 与监听线程互斥；macOS 上 NSPasteboard 调度到主线程执行。
+fn set_clipboard_files_safe(app: &AppHandle, paths: &[String], text: &str) -> Result<(), String> {
+    let _guard = CLIPBOARD_LOCK.lock().unwrap();
+    #[cfg(target_os = "macos")]
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let paths = paths.to_vec();
+        let text = text.to_string();
+        app.run_on_main_thread(move || {
+            let _ = tx.send(set_clipboard_files_platform(&paths, &text));
+        })
+        .map_err(|e| format!("调度主线程失败: {e}"))?;
+        rx.recv().map_err(|_| "主线程写剪贴板无响应".to_string())?
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        set_clipboard_files_platform(paths, text)
+    }
+}
+
+// ---------- Windows 原生图片兜底 ----------
+// 有些截图软件只写 CF_BITMAP / CF_DIB，arboard 读不到，这里直接走 Win32 取图
+
+// 按掩码提取颜色分量并扩展到 8 位
+#[cfg(target_family = "windows")]
+fn extract_masked(v: u32, mask: u32) -> u8 {
+    if mask == 0 {
+        return 0;
+    }
+    let raw = (v & mask) >> mask.trailing_zeros();
+    let max = (1u32 << mask.count_ones()) - 1;
+    ((raw * 255 + max / 2) / max) as u8
+}
+
+// 把 DIB 数据解析成 RGBA 像素（支持 16/24/32 位、BI_RGB 与 BI_BITFIELDS）
+#[cfg(target_family = "windows")]
+fn rgba_from_dib(dib: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    if dib.len() < 40 {
+        return None;
+    }
+    let u32_at = |off: usize| -> u32 { u32::from_le_bytes([dib[off], dib[off + 1], dib[off + 2], dib[off + 3]]) };
+    let header_size = u32_at(0) as usize;
+    // 只支持 BITMAPINFOHEADER(40) 及以上，古老的 BITMAPCOREHEADER(12) 不处理
+    if header_size < 40 || dib.len() < header_size {
+        return None;
+    }
+    let width = u32_at(4) as i32;
+    let raw_height = u32_at(8) as i32;
+    let bit_count = u16::from_le_bytes([dib[14], dib[15]]);
+    let compression = u32_at(16);
+    let clr_used = u32_at(32) as usize;
+    if width <= 0 || raw_height == 0 {
+        return None;
+    }
+    let w = width as usize;
+    let h = raw_height.unsigned_abs() as usize;
+    let top_down = raw_height < 0;
+
+    const BI_RGB: u32 = 0;
+    const BI_BITFIELDS: u32 = 3;
+
+    // 像素数据偏移 = 头 + （40 字节头的位掩码）+ 色表
+    let mut off = header_size;
+    let (mut r_mask, mut g_mask, mut b_mask) = (0u32, 0u32, 0u32);
+    if compression == BI_BITFIELDS {
+        if header_size >= 52 {
+            // BITMAPV4/V5 头：掩码在头内
+            r_mask = u32_at(40);
+            g_mask = u32_at(44);
+            b_mask = u32_at(48);
+        } else {
+            if dib.len() < off + 12 {
+                return None;
+            }
+            r_mask = u32_at(off);
+            g_mask = u32_at(off + 4);
+            b_mask = u32_at(off + 8);
+            off += 12;
+        }
+    } else if compression != BI_RGB {
+        return None; // 压缩格式（RLE/JPEG 等）不支持
+    }
+    if bit_count <= 8 {
+        let n = if clr_used > 0 { clr_used } else { 1usize << bit_count };
+        off += n * 4;
+    }
+    let bytes_pp = (bit_count / 8) as usize;
+    if bytes_pp < 2 || dib.len() < off {
+        return None;
+    }
+    let pixels = &dib[off..];
+    let stride = (w * bytes_pp + 3) & !3; // 行对齐到 4 字节
+
+    let mut rgba = vec![0u8; w * h * 4];
+    let mut any_alpha = false;
+    for y in 0..h {
+        let src_y = if top_down { y } else { h - 1 - y }; // bottom-up 翻正
+        let start = src_y * stride;
+        let end = start + w * bytes_pp;
+        if end > pixels.len() {
+            return None;
+        }
+        let row = &pixels[start..end];
+        for x in 0..w {
+            let p = &row[x * bytes_pp..];
+            let (r, g, b, a) = match bit_count {
+                32 => {
+                    if compression == BI_BITFIELDS {
+                        let v = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
+                        (
+                            extract_masked(v, r_mask),
+                            extract_masked(v, g_mask),
+                            extract_masked(v, b_mask),
+                            255,
+                        )
+                    } else {
+                        (p[2], p[1], p[0], p[3])
+                    }
+                }
+                24 => (p[2], p[1], p[0], 255),
+                16 => {
+                    let v = u16::from_le_bytes([p[0], p[1]]) as u32;
+                    // BI_RGB 的 16 位是 555，BI_BITFIELDS 按掩码（常见 565）
+                    let (rm, gm, bm) = if compression == BI_BITFIELDS {
+                        (r_mask, g_mask, b_mask)
+                    } else {
+                        (0x7C00, 0x03E0, 0x001F)
+                    };
+                    (
+                        extract_masked(v, rm),
+                        extract_masked(v, gm),
+                        extract_masked(v, bm),
+                        255,
+                    )
+                }
+                _ => return None,
+            };
+            if a != 0 {
+                any_alpha = true;
+            }
+            let o = (y * w + x) * 4;
+            rgba[o] = r;
+            rgba[o + 1] = g;
+            rgba[o + 2] = b;
+            rgba[o + 3] = a;
+        }
+    }
+    // 32 位 BI_RGB 的 alpha 通道经常是未定义的全 0，统一设为不透明
+    if !any_alpha {
+        for px in rgba.chunks_exact_mut(4) {
+            px[3] = 255;
+        }
+    }
+    Some((rgba, w as u32, h as u32))
+}
+
+// CF_BITMAP 是位图句柄而非内存块：用 GetDIBits 转成 32 位 DIB
+#[cfg(target_family = "windows")]
+fn dib_from_bitmap(hbmp: *mut std::ffi::c_void) -> Option<Vec<u8>> {
+    #[repr(C)]
+    struct Bmp {
+        bm_type: i32,
+        bm_width: i32,
+        bm_height: i32,
+        bm_width_bytes: i32,
+        bm_planes: u16,
+        bm_bits_pixel: u16,
+        bm_bits: *mut std::ffi::c_void,
+    }
+    type Handle = *mut std::ffi::c_void;
+    extern "system" {
+        fn GetObjectW(h: Handle, n: i32, v: *mut std::ffi::c_void) -> i32;
+        fn GetDC(hwnd: Handle) -> Handle;
+        fn ReleaseDC(hwnd: Handle, hdc: Handle) -> i32;
+        fn GetDIBits(hdc: Handle, hbmp: Handle, start: u32, lines: u32, bits: *mut u8, bmi: *mut u8, usage: u32) -> i32;
+    }
+    unsafe {
+        let mut b: Bmp = std::mem::zeroed();
+        if GetObjectW(hbmp, std::mem::size_of::<Bmp>() as i32, &mut b as *mut Bmp as *mut _) == 0 {
+            return None;
+        }
+        if b.bm_width <= 0 || b.bm_height == 0 {
+            return None;
+        }
+        let w = b.bm_width as usize;
+        let h = b.bm_height.unsigned_abs() as usize;
+        // BITMAPINFOHEADER(40 字节) + 32 位像素数据
+        let mut dib = vec![0u8; 40 + w * h * 4];
+        dib[0..4].copy_from_slice(&40u32.to_le_bytes());
+        dib[4..8].copy_from_slice(&b.bm_width.to_le_bytes());
+        dib[8..12].copy_from_slice(&b.bm_height.to_le_bytes()); // 保留原方向
+        dib[12..14].copy_from_slice(&1u16.to_le_bytes()); // planes
+        dib[14..16].copy_from_slice(&32u16.to_le_bytes()); // bpp
+        // compression 保持 BI_RGB(0)
+        let hdc = GetDC(std::ptr::null_mut());
+        if hdc.is_null() {
+            return None;
+        }
+        let got = GetDIBits(hdc, hbmp, 0, h as u32, dib[40..].as_mut_ptr(), dib.as_mut_ptr(), 0);
+        ReleaseDC(std::ptr::null_mut(), hdc);
+        if got == 0 {
+            return None;
+        }
+        Some(dib)
+    }
+}
+
+// arboard 读不到图片时的兜底：按 "PNG" → CF_DIBV5 → CF_DIB → CF_BITMAP 顺序取图
+#[cfg(target_family = "windows")]
+fn clipboard_image_native() -> Option<(Vec<u8>, u32, u32)> {
+    const CF_BITMAP: u32 = 2;
+    const CF_DIB: u32 = 8;
+    const CF_DIBV5: u32 = 17;
+    type Handle = *mut std::ffi::c_void;
+    extern "system" {
+        fn OpenClipboard(hwnd: Handle) -> i32;
+        fn CloseClipboard() -> i32;
+        fn GetClipboardData(fmt: u32) -> Handle;
+        fn IsClipboardFormatAvailable(fmt: u32) -> i32;
+        fn RegisterClipboardFormatW(name: *const u16) -> u32;
+        fn GlobalLock(h: Handle) -> Handle;
+        fn GlobalUnlock(h: Handle) -> i32;
+        fn GlobalSize(h: Handle) -> usize;
+    }
+    unsafe {
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            return None;
+        }
+        let mut out: Option<(Vec<u8>, u32, u32)> = None;
+
+        // 1. "PNG" 自定义格式（QQ、浏览器等），数据本身就是 PNG 文件
+        let png_name: Vec<u16> = "PNG".encode_utf16().chain(std::iter::once(0)).collect();
+        let png_fmt = RegisterClipboardFormatW(png_name.as_ptr());
+        if png_fmt != 0 && IsClipboardFormatAvailable(png_fmt) != 0 {
+            let hnd = GetClipboardData(png_fmt);
+            if !hnd.is_null() {
+                let size = GlobalSize(hnd);
+                let p = GlobalLock(hnd);
+                if !p.is_null() && size > 8 {
+                    let bytes = std::slice::from_raw_parts(p as *const u8, size).to_vec();
+                    GlobalUnlock(hnd);
+                    if let Ok(img) = image::load_from_memory(&bytes) {
+                        out = Some((bytes, img.width(), img.height()));
+                    }
+                } else if !p.is_null() {
+                    GlobalUnlock(hnd);
+                }
+            }
+        }
+
+        // 2. DIB / DIBV5
+        if out.is_none() {
+            for fmt in [CF_DIBV5, CF_DIB] {
+                if IsClipboardFormatAvailable(fmt) == 0 {
+                    continue;
+                }
+                let hnd = GetClipboardData(fmt);
+                if hnd.is_null() {
+                    continue;
+                }
+                let size = GlobalSize(hnd);
+                let p = GlobalLock(hnd);
+                if p.is_null() || size < 40 {
+                    if !p.is_null() {
+                        GlobalUnlock(hnd);
+                    }
+                    continue;
+                }
+                let bytes = std::slice::from_raw_parts(p as *const u8, size).to_vec();
+                GlobalUnlock(hnd);
+                if let Some((rgba, w, h)) = rgba_from_dib(&bytes) {
+                    if let Some(img) = image::RgbaImage::from_raw(w, h, rgba) {
+                        out = encode_png(img);
+                    }
+                }
+                if out.is_some() {
+                    break;
+                }
+            }
+        }
+
+        // 3. CF_BITMAP（只写位图句柄的截图软件，如部分系统/第三方截图工具）
+        if out.is_none() && IsClipboardFormatAvailable(CF_BITMAP) != 0 {
+            let hbmp = GetClipboardData(CF_BITMAP); // GDI 句柄，不能 GlobalLock
+            if !hbmp.is_null() {
+                if let Some(dib) = dib_from_bitmap(hbmp) {
+                    if let Some((rgba, w, h)) = rgba_from_dib(&dib) {
+                        if let Some(img) = image::RgbaImage::from_raw(w, h, rgba) {
+                            out = encode_png(img);
+                        }
+                    }
+                }
+            }
+        }
+
+        CloseClipboard();
+        out
+    }
+}
+
+#[cfg(not(target_family = "windows"))]
+fn clipboard_image_native() -> Option<(Vec<u8>, u32, u32)> {
+    None
+}
+
+// 读取剪贴板图片：先走 arboard，读不到再用 Windows 原生兜底
+fn read_image(cb: &mut Clipboard) -> Option<(Vec<u8>, u32, u32)> {
+    if let Ok(img) = cb.get_image() {
+        if let Some(r) = png_from_arboard(&img) {
+            return Some(r);
+        }
+    }
+    clipboard_image_native()
+}
+
+fn is_excluded(cfg: &AppConfig) -> bool {
+    if cfg.exclude_apps.is_empty() {
+        return false;
+    }
+    match foreground_exe_name() {
+        Some(name) => cfg.exclude_apps.iter().any(|e| {
+            let e = e.trim().to_lowercase();
+            !e.is_empty() && (name == e || name == format!("{e}.exe"))
+        }),
+        None => false,
+    }
+}
+
+// 剪贴板候选内容
+enum Cand {
+    Text(String, u64),
+    Image(Vec<u8>, u32, u32, u64),
+    File(String, u64),
+}
+
+impl Cand {
+    fn hash(&self) -> u64 {
+        match self {
+            Cand::Text(_, h) | Cand::Image(_, _, _, h) | Cand::File(_, h) => *h,
+        }
+    }
+}
+
+fn read_clipboard(cb: &mut Clipboard) -> Option<Cand> {
+    // macOS：访达 ⌘C 文件时剪贴板除文件 URL 外还常带文件名/路径字符串，
+    // 必须先判文件列表，否则文件会被当成纯文本入库
+    #[cfg(target_os = "macos")]
+    if let Some(files) = clipboard_files() {
+        let joined = files.join("\n");
+        let h = hash_bytes(joined.as_bytes());
+        return Some(Cand::File(joined, h));
+    }
+    if let Ok(text) = cb.get_text() {
+        let text = text.trim_end_matches('\0').to_string();
+        if !text.is_empty() {
+            let h = hash_bytes(text.as_bytes());
+            return Some(Cand::Text(text, h));
+        }
+    }
+    if let Some((png, w, hgt)) = read_image(cb) {
+        if png.len() <= 20 * 1024 * 1024 {
+            let h = hash_bytes(&png);
+            return Some(Cand::Image(png, w, hgt, h));
+        }
+        // 图片超过 20MB 上限，放弃本轮（不再尝试文件，避免把大图路径当文件记录）
+        return None;
+    }
+    clipboard_files().map(|files| {
+        let joined = files.join("\n");
+        let h = hash_bytes(joined.as_bytes());
+        Cand::File(joined, h)
+    })
+}
+
+// 把哈希加入忽略集合（去重、上限 64 条）
+fn push_ignored(state: &AppState, h: u64) {
+    let mut ig = state.ignored_hashes.lock().unwrap();
+    if !ig.contains(&h) {
+        if ig.len() >= 64 {
+            ig.remove(0);
+        }
+        ig.push(h);
+    }
+}
+
+fn start_watcher(app: AppHandle) {
+    std::thread::spawn(move || {
+        let mut cb = match Clipboard::new() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        loop {
+            std::thread::sleep(Duration::from_millis(600));
+            let state = app.state::<AppState>();
+
+            // 窗口尺寸落盘：Resize 事件只暂存，这里统一保存（天然去抖）
+            {
+                let mut pending = state.pending_size.lock().unwrap();
+                if let Some((w, h)) = pending.take() {
+                    let mut cfg = state.config.lock().unwrap();
+                    if cfg.remember_size {
+                        cfg.window_width = w;
+                        cfg.window_height = h;
+                        drop(cfg);
+                        let _ = persist_config(&state);
+                    }
+                }
+            }
+            // 工具箱禁止剪贴板能力时仍保留窗口尺寸落盘线程，但不读取系统剪贴板。
+            if !office_plugin::allowed("ALLOW_CLIPBOARD") { continue; }
+
+            let (enabled, excluded, max_items) = {
+                let cfg = state.config.lock().unwrap();
+                // 每轮顺便执行保留时长清理（删除过期的非置顶记录）
+                let db = state.db.lock().unwrap();
+                apply_retention(&db, &cfg);
+                (cfg.enabled, is_excluded(&cfg), cfg.max_items)
+            };
+
+            let Some(cand) = ({
+                let _g = CLIPBOARD_LOCK.lock().unwrap();
+                read_clipboard(&mut cb)
+            }) else {
+                continue;
+            };
+            let h = cand.hash();
+
+            // 剪贴板内容没变化，跳过
+            {
+                let mut last = state.last_seen.lock().unwrap();
+                if *last == h {
+                    continue;
+                }
+                *last = h;
+            }
+
+            // 记录开关关闭：只标记已见，不存储（重新开启时之前的内容不会补录）
+            if !enabled {
+                continue;
+            }
+
+            // 排除的应用：在该应用中复制的内容加入忽略集合，离开/移除排除后也不入库
+            if excluded {
+                push_ignored(&state, h);
+                continue;
+            }
+
+            // 被忽略的内容（刚删除的 / 排除应用里复制的）跳过
+            {
+                let mut ig = state.ignored_hashes.lock().unwrap();
+                if ig.contains(&h) {
+                    continue;
+                }
+                // 有新内容正常入库，旧的忽略记录不再需要
+                ig.clear();
+            }
+
+            let db = state.db.lock().unwrap();
+            let changed = match &cand {
+                Cand::Text(text, h) => store_clip(&db, "text", Some(text), None, None, None, *h),
+                Cand::Image(png, w, hgt, h) => {
+                    store_clip(&db, "image", None, Some(png), Some(*w), Some(*hgt), *h)
+                }
+                Cand::File(joined, h) => store_clip(&db, "file", Some(joined), None, None, None, *h),
+            };
+            if changed {
+                prune(&db, max_items);
+                let _ = app.emit("clip-added", ());
+                // 云端中继：文本默认走中继；图片需开「图片经中继」开关（设计文档 §7.3）
+                match &cand {
+                    Cand::Text(text, h) => {
+                        drop(db);
+                        relay::push_local_text(&state, text, *h);
+                    }
+                    Cand::Image(png, w, hgt, h) => {
+                        drop(db);
+                        relay::push_local_image(&state, png, *w, *hgt, *h);
+                    }
+                    Cand::File(..) => {}
+                }
+            }
+        }
+    });
+}
+
+// 删除记录 / 重新开启记录时调用：读取当前系统剪贴板内容哈希并加入忽略集合
+fn ignore_current_clipboard(state: &AppState) {
+    let h = (|| {
+        let _g = CLIPBOARD_LOCK.lock().unwrap();
+        let mut cb = Clipboard::new().ok()?;
+        read_clipboard(&mut cb).map(|c| c.hash())
+    })();
+    if let Some(h) = h {
+        push_ignored(state, h);
+        // 同时标记为已见，防止轮询把当前内容当新内容处理
+        *state.last_seen.lock().unwrap() = h;
+    }
+}
+
+// ---------- 命令 ----------
+
+#[tauri::command]
+fn list_clips(state: State<AppState>, keyword: Option<String>) -> Vec<Clip> {
+    let db = state.db.lock().unwrap();
+    // 列表查询不读取 image blob，图片由前端懒加载（get_clip_image），避免大数据量卡顿。
+    // 「全部」与「文字」各取 500 条，其余分类各取 100 条；分类独立限额，避免被全局 500 条挤占。
+    // 文件分类沿用 category_of 的扩展名表，SQL 只取第一个文件路径末尾的扩展名做匹配。
+    let first_path = "lower(substr(content, 1, instr(content || char(10), char(10)) - 1))";
+    let ext_matches = |exts: &[&str]| {
+        exts.iter()
+            .map(|e| format!("{first_path} LIKE '%.{e}'"))
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    };
+    let video_match = ext_matches(VIDEO_EXTS);
+    let office_match = ext_matches(OFFICE_EXTS);
+    let category_sql = format!(
+        "CASE
+             WHEN kind = 'text' THEN 'text'
+             WHEN kind = 'image' THEN 'image'
+             WHEN kind = 'file' AND ({video_match}) THEN 'video'
+             WHEN kind = 'file' AND ({office_match}) THEN 'office'
+             ELSE 'file'
+         END"
+    );
+    // 拼音列在入库时生成（中文转无声调全拼/首字母，其余字符小写），
+    // SQLite LIKE 对 ASCII 不区分大小写，大写输入也能命中。
+    let kw = keyword
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .map(|k| format!("%{k}%"));
+    let where_sql = if kw.is_some() {
+        "WHERE content LIKE ?1 OR pinyin_full LIKE ?1 OR pinyin_abbr LIKE ?1"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "WITH matched AS (
+             SELECT id, kind, content, width, height, pinned, created_at,
+                    {category_sql} AS category
+             FROM clips
+             {where_sql}
+         ), ranked AS (
+             SELECT *,
+                    ROW_NUMBER() OVER (ORDER BY pinned DESC, created_at DESC) AS all_rank,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY category ORDER BY pinned DESC, created_at DESC
+                    ) AS category_rank
+             FROM matched
+         )
+         SELECT id, kind, content, width, height, pinned, created_at
+         FROM ranked
+         WHERE all_rank <= 500
+            OR (category = 'text' AND category_rank <= 500)
+            OR (category <> 'text' AND category_rank <= 100)
+         ORDER BY pinned DESC, created_at DESC"
+    );
+    let mut stmt = match db.prepare(&sql) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    // 原始关键词（去空格），供逐行计算高亮区间；拼音回退只对没有直接命中的行做逐字转换
+    let kw_raw = keyword.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let map_row = |row: &rusqlite::Row| -> rusqlite::Result<Clip> {
+        let kind: String = row.get(1)?;
+        let content: Option<String> = row.get(2)?;
+        let w: Option<u32> = row.get(3)?;
+        let h: Option<u32> = row.get(4)?;
+        let url = content.as_deref().and_then(first_url);
+        let category = category_of(&kind, content.as_deref()).to_string();
+        let preview = if kind == "image" {
+            format!("[图片 {}x{}]", w.unwrap_or(0), h.unwrap_or(0))
+        } else if kind == "file" {
+            // content 为换行分隔的文件路径列表
+            let paths: Vec<&str> = content
+                .as_deref()
+                .unwrap_or("")
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .collect();
+            let first = paths
+                .first()
+                .and_then(|p| p.rsplit(['\\', '/']).next())
+                .unwrap_or("文件");
+            if paths.len() > 1 {
+                format!("📄 {} 等 {} 个文件", first, paths.len())
+            } else {
+                format!("📄 {}", first)
+            }
+        } else {
+            let t = content.unwrap_or_default();
+            t.chars().take(300).collect()
+        };
+        let match_ranges = match kw_raw {
+            Some(k) => match_ranges(&preview, k),
+            None => vec![],
+        };
+        Ok(Clip {
+            id: row.get(0)?,
+            category,
+            kind,
+            preview,
+            image_b64: None, // 列表不携带图片数据
+            url,
+            pinned: row.get::<_, i64>(5)? != 0,
+            created_at: row.get(6)?,
+            match_ranges,
+        })
+    };
+    let rows = match kw {
+        Some(k) => stmt.query_map(params![k], map_row),
+        None => stmt.query_map([], map_row),
+    };
+    match rows {
+        Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),
+        Err(_) => vec![],
+    }
+}
+
+// 前端懒加载图片：滚动到可视区域时才取回 base64
+#[tauri::command]
+fn get_clip_image(state: State<AppState>, id: i64) -> Option<String> {
+    let db = state.db.lock().unwrap();
+    let img: Option<Vec<u8>> = db
+        .query_row("SELECT image FROM clips WHERE id=?1", params![id], |r| r.get(0))
+        .ok()?;
+    img.map(|b| B64.encode(b))
+}
+
+#[tauri::command]
+fn toggle_pin(state: State<AppState>, id: i64) -> Result<bool, String> {
+    let db = state.db.lock().unwrap();
+    db.execute(
+        "UPDATE clips SET pinned = CASE WHEN pinned = 0 THEN 1 ELSE 0 END WHERE id = ?1",
+        params![id],
+    )
+    .map_err(|e| e.to_string())?;
+    let pinned: i64 = db
+        .query_row("SELECT pinned FROM clips WHERE id=?1", params![id], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    Ok(pinned != 0)
+}
+
+fn set_clipboard_by_id(state: &AppState, id: i64) -> Result<(), String> {
+    let (kind, content, img) = {
+        let db = state.db.lock().unwrap();
+        db.query_row(
+            "SELECT kind, content, image FROM clips WHERE id=?1",
+            params![id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<Vec<u8>>>(2)?,
+                ))
+            },
+        )
+        .map_err(|e| e.to_string())?
+    };
+    let mut cb = Clipboard::new().map_err(|e| e.to_string())?;
+    if kind == "image" {
+        let png = img.ok_or("empty image")?;
+        let dynimg = image::load_from_memory(&png)
+            .map_err(|e| e.to_string())?
+            .to_rgba8();
+        let (w, h) = dynimg.dimensions();
+        cb.set_image(arboard::ImageData {
+            width: w as usize,
+            height: h as usize,
+            bytes: dynimg.into_raw().into(),
+        })
+        .map_err(|e| e.to_string())?;
+    } else {
+        let text = content.unwrap_or_default();
+        cb.set_text(text.clone()).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+// 写剪贴板（粘贴/仅复制共用入口）：
+// 全程持 CLIPBOARD_LOCK 与监听线程的读互斥；macOS 上 NSPasteboard 只允许主线程访问，
+// 否则与 WebKit 主线程的剪贴板轮询竞争导致闪退，故 mac 调度到主线程执行并同步等待结果。
+fn set_clipboard_by_id_safe(app: &AppHandle, id: i64) -> Result<(), String> {
+    let _guard = CLIPBOARD_LOCK.lock().unwrap();
+    #[cfg(target_os = "macos")]
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let app2 = app.clone();
+        app.run_on_main_thread(move || {
+            let st = app2.state::<AppState>();
+            let _ = tx.send(set_clipboard_by_id(&st, id));
+        })
+        .map_err(|e| format!("调度主线程失败: {e}"))?;
+        rx.recv().map_err(|_| "主线程写剪贴板无响应".to_string())?
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let st = app.state::<AppState>();
+        set_clipboard_by_id(&st, id)
+    }
+}
+
+#[tauri::command]
+fn copy_clip(app: AppHandle, id: i64) -> Result<(), String> {
+    set_clipboard_by_id_safe(&app, id)
+}
+
+// 前台窗口句柄读取/归还（Windows）
+#[cfg(target_family = "windows")]
+fn foreground_hwnd() -> isize {
+    extern "system" {
+        fn GetForegroundWindow() -> *mut std::ffi::c_void;
+    }
+    unsafe { GetForegroundWindow() as isize }
+}
+
+#[cfg(target_family = "windows")]
+fn focus_hwnd(hwnd: isize) {
+    extern "system" {
+        fn SetForegroundWindow(h: *mut std::ffi::c_void) -> i32;
+    }
+    unsafe {
+        SetForegroundWindow(hwnd as *mut std::ffi::c_void);
+    }
+}
+
+#[cfg(not(target_family = "windows"))]
+fn foreground_hwnd() -> isize {
+    0
+}
+
+#[cfg(not(target_family = "windows"))]
+fn focus_hwnd(_hwnd: isize) {}
+
+fn simulate_paste() {
+    use enigo::{Direction, Enigo, Key, Keyboard, Settings};
+    if let Ok(mut enigo) = Enigo::new(&Settings::default()) {
+        let modifier = if cfg!(target_os = "macos") {
+            Key::Meta
+        } else {
+            Key::Control
+        };
+        let _ = enigo.key(modifier, Direction::Press);
+        // macOS 上必须用物理键码 Other(0x09)（kVK_ANSI_V）：Key::Unicode 会走
+        // enigo 0.2.1 的 get_layoutdependent_keycode → TIS 键盘布局查询，
+        // 在后台线程 TISGetInputSourceProperty 可能返回 NULL，
+        // release 版直接 CFDataGetBytePtr(NULL) 段错误（进程闪退）
+        #[cfg(target_os = "macos")]
+        let v_key = Key::Other(9);
+        #[cfg(not(target_os = "macos"))]
+        let v_key = Key::Unicode('v');
+        let _ = enigo.key(v_key, Direction::Click);
+        let _ = enigo.key(modifier, Direction::Release);
+    }
+}
+
+// 模拟粘贴入口：macOS 上 enigo 初始化会调用 AppKit（NSEvent::doubleClickInterval），
+// AppKit 应在主线程访问，故 mac 调度到主线程执行并同步等待；其他平台原线程执行。
+fn simulate_paste_safe(app: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        if app
+            .run_on_main_thread(move || {
+                simulate_paste();
+                let _ = tx.send(());
+            })
+            .is_ok()
+        {
+            let _ = rx.recv();
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        simulate_paste();
+    }
+}
+
+// macOS：查询键盘焦点控件的 AX 角色（辅助功能 API，粘贴时调用，仅作诊断日志）。
+// 注意：角色黑名单/白名单曾被用来拦截粘贴，但自定义渲染的编辑器（如 Sublime Text，
+// 焦点角色是 AXScrollArea 等容器角色）会被误伤——v1.6.6~v1.6.9 的教训。
+// 现在拦截只认「前台是访达」这一确定性条件（⌘V 落成「文本剪贴」文件只有访达会干），
+// 本函数的返回值不再参与粘贴决策。
+// 前置：模拟 ⌘V 本就要求辅助功能权限（paste_worker 已先 ensure_accessibility）。
+#[cfg(target_os = "macos")]
+fn focused_element_role() -> Option<String> {
+    use std::ffi::{c_char, c_void, CStr};
+    type CFRef = *const c_void;
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFStringCreateWithCString(alloc: CFRef, s: *const c_char, encoding: u32) -> CFRef;
+        fn CFStringGetCString(s: CFRef, buf: *mut c_char, size: isize, encoding: u32) -> bool;
+        fn CFRelease(cf: CFRef);
+    }
+    #[link(name = "ApplicationServices", kind = "framework")]
+    extern "C" {
+        fn AXUIElementCreateSystemWide() -> CFRef;
+        fn AXUIElementCopyAttributeValue(element: CFRef, attribute: CFRef, value: *mut CFRef) -> i32;
+    }
+    const UTF8: u32 = 0x0800_0100; // kCFStringEncodingUTF8
+    unsafe {
+        let system = AXUIElementCreateSystemWide();
+        if system.is_null() {
+            return None;
+        }
+        let attr_focused =
+            CFStringCreateWithCString(std::ptr::null(), b"AXFocusedUIElement\0".as_ptr() as *const c_char, UTF8);
+        let attr_role =
+            CFStringCreateWithCString(std::ptr::null(), b"AXRole\0".as_ptr() as *const c_char, UTF8);
+        // 取系统级焦点控件
+        let mut focused: CFRef = std::ptr::null();
+        let got_focused = !attr_focused.is_null()
+            && AXUIElementCopyAttributeValue(system, attr_focused, &mut focused) == 0
+            && !focused.is_null();
+        // 取焦点控件的角色字符串
+        let mut role_buf = [0 as c_char; 128];
+        let mut got_role = false;
+        if got_focused && !attr_role.is_null() {
+            let mut role: CFRef = std::ptr::null();
+            if AXUIElementCopyAttributeValue(focused, attr_role, &mut role) == 0 && !role.is_null() {
+                got_role = CFStringGetCString(role, role_buf.as_mut_ptr(), role_buf.len() as isize, UTF8);
+                CFRelease(role);
+            }
+        }
+        // 统一释放（Create/Copy 规则拿到的引用）
+        if got_focused {
+            CFRelease(focused);
+        }
+        if !attr_focused.is_null() {
+            CFRelease(attr_focused);
+        }
+        if !attr_role.is_null() {
+            CFRelease(attr_role);
+        }
+        CFRelease(system);
+        if !got_focused || !got_role {
+            return None;
+        }
+        Some(CStr::from_ptr(role_buf.as_ptr()).to_string_lossy().into_owned())
+    }
+}
+
+// ---------- macOS 前台 App（NSWorkspace / NSRunningApplication 裸 FFI） ----------
+// 不走 lsappinfo 命令行解析：其输出格式（ASN 前缀、键值分隔符、尾部分号）随系统
+// 版本变动，解析失败会静默退化成「无目标记录」，焦点归还落空后 ⌘V 打进访达生成
+// 「文本剪贴」文件。NSWorkspace 是结构化 API，结果确定，且无需 spawn 进程。
+#[cfg(target_os = "macos")]
+mod mac_front {
+    use super::FrontApp;
+    use std::ffi::{c_char, c_void, CStr, CString};
+
+    type Id = *mut c_void;
+    #[link(name = "objc", kind = "dylib")]
+    extern "C" {
+        fn objc_getClass(name: *const c_char) -> Id;
+        fn sel_registerName(name: *const c_char) -> Id;
+        // objc_msgSend 真实签名是可变参数，这里不声明签名，调用点 transmute 成所需签名
+        //（同一符号多签名 extern 声明会触发 clashing_extern_declarations 警告）
+        fn objc_msgSend();
+    }
+
+    unsafe fn msg0<R>(receiver: Id, op: Id) -> R {
+        let f: unsafe extern "C" fn(Id, Id) -> R =
+            std::mem::transmute(objc_msgSend as *const c_void);
+        f(receiver, op)
+    }
+    unsafe fn msg1<R, A>(receiver: Id, op: Id, a: A) -> R {
+        let f: unsafe extern "C" fn(Id, Id, A) -> R =
+            std::mem::transmute(objc_msgSend as *const c_void);
+        f(receiver, op, a)
+    }
+
+    fn class(name: &str) -> Id {
+        let name = CString::new(name).unwrap();
+        unsafe { objc_getClass(name.as_ptr()) }
+    }
+    fn sel(name: &str) -> Id {
+        let name = CString::new(name).unwrap();
+        unsafe { sel_registerName(name.as_ptr()) }
+    }
+
+    // 后台线程（paste_worker）没有 autorelease pool，直接调 AppKit 会泄漏并刷警告；
+    // 包一层 NSAutoreleasePool。主线程调用同样安全（嵌套 pool 合法）。
+    fn with_pool<R>(f: impl FnOnce() -> R) -> R {
+        unsafe {
+            let pool: Id = msg0(msg0::<Id>(class("NSAutoreleasePool"), sel("alloc")), sel("init"));
+            let r = f();
+            if !pool.is_null() {
+                msg0::<()>(pool, sel("drain"));
+            }
+            r
+        }
+    }
+
+    unsafe fn ns_to_string(s: Id) -> Option<String> {
+        if s.is_null() {
+            return None;
+        }
+        let p = msg0::<Id>(s, sel("UTF8String")) as *const c_char;
+        if p.is_null() {
+            return None;
+        }
+        let v = CStr::from_ptr(p).to_string_lossy().into_owned();
+        (!v.is_empty()).then_some(v)
+    }
+
+    /// 当前前台 App 的 pid + bundle id（NSWorkspace.frontmostApplication）
+    pub fn frontmost_app() -> FrontApp {
+        with_pool(|| unsafe {
+            let ws: Id = msg0(class("NSWorkspace"), sel("sharedWorkspace"));
+            let app: Id = if ws.is_null() {
+                std::ptr::null_mut()
+            } else {
+                msg0(ws, sel("frontmostApplication"))
+            };
+            if app.is_null() {
+                return FrontApp::default();
+            }
+            let pid = msg0::<i32>(app, sel("processIdentifier"));
+            FrontApp {
+                pid: (pid > 0).then_some(pid),
+                bundle: ns_to_string(msg0::<Id>(app, sel("bundleIdentifier"))),
+            }
+        })
+    }
+
+    /// 按 pid 激活 App（NSRunningApplication activateWithOptions:，
+    /// NSApplicationActivateIgnoringOtherApps = 1<<1）。进程已退出/激活失败返回 false。
+    /// 该 API 在 macOS 14 起标记 deprecated 但仍正常工作，且无平替的同步语义。
+    pub fn activate_pid(pid: i32) -> bool {
+        with_pool(|| unsafe {
+            let app: Id = msg1(
+                class("NSRunningApplication"),
+                sel("runningApplicationWithProcessIdentifier:"),
+                pid,
+            );
+            if app.is_null() {
+                return false;
+            }
+            msg1::<bool, usize>(app, sel("activateWithOptions:"), 1 << 1)
+        })
+    }
+
+    // ---------- NSPasteboard 文件列表读写（「粘贴文件」/ 访达拷贝检测） ----------
+
+    unsafe fn msg2<R, A, B>(receiver: Id, op: Id, a: A, b: B) -> R {
+        let f: unsafe extern "C" fn(Id, Id, A, B) -> R =
+            std::mem::transmute(objc_msgSend as *const c_void);
+        f(receiver, op, a, b)
+    }
+
+    fn ns_string(s: &str) -> Id {
+        // 路径不含 NUL；unwrap_or_else 保底返回空字符串
+        let c = CString::new(s).unwrap_or_else(|_| CString::new("").unwrap());
+        unsafe { msg1(class("NSString"), sel("stringWithUTF8String:"), c.as_ptr()) }
+    }
+
+    fn ns_array(items: &[Id]) -> Id {
+        unsafe {
+            let arr: Id = msg0(
+                msg0::<Id>(class("NSMutableArray"), sel("alloc")),
+                sel("init"),
+            );
+            for &it in items {
+                msg1::<(), Id>(arr, sel("addObject:"), it);
+            }
+            arr
+        }
+    }
+
+    /// 写入文件列表 + 纯文本路径双格式：聊天框/访达拿文件，文本框拿路径。
+    /// 用 declareTypes + setPropertyList(NSFilenamesPboardType) 而非 writeObjects：
+    /// 同一剪贴板项共存两种格式，且访达/老应用对 legacy 类型支持最稳。
+    pub fn set_files(paths: &[String], text: &str) -> bool {
+        with_pool(|| unsafe {
+            let pb: Id = msg0(class("NSPasteboard"), sel("generalPasteboard"));
+            if pb.is_null() {
+                return false;
+            }
+            let t_files = ns_string("NSFilenamesPboardType");
+            let t_str = ns_string("NSStringPboardType");
+            let types = ns_array(&[t_files, t_str]);
+            msg2::<i64, Id, Id>(pb, sel("declareTypes:owner:"), types, std::ptr::null_mut());
+            let path_objs: Vec<Id> = paths.iter().map(|p| ns_string(p)).collect();
+            let arr = ns_array(&path_objs);
+            let ok1 = msg2::<bool, Id, Id>(pb, sel("setPropertyList:forType:"), arr, t_files);
+            // 文本兜底失败可容忍，文件格式已可用
+            let _ = msg2::<bool, Id, Id>(pb, sel("setString:forType:"), ns_string(text), t_str);
+            ok1
+        })
+    }
+
+    /// 读取剪贴板中的文件路径列表（访达 ⌘C 拷贝文件/文件夹）。
+    /// NSFilenamesPboardType 与现代 NSPasteboardTypeFileURL 由系统自动互转。
+    pub fn copied_files() -> Option<Vec<String>> {
+        with_pool(|| unsafe {
+            let pb: Id = msg0(class("NSPasteboard"), sel("generalPasteboard"));
+            if pb.is_null() {
+                return None;
+            }
+            let t_files = ns_string("NSFilenamesPboardType");
+            let arr: Id = msg1(pb, sel("propertyListForType:"), t_files);
+            if arr.is_null() {
+                return None;
+            }
+            let count = msg0::<usize>(arr, sel("count"));
+            let mut out = Vec::new();
+            for i in 0..count {
+                let s: Id = msg1(arr, sel("objectAtIndex:"), i);
+                if let Some(p) = ns_to_string(s) {
+                    out.push(p);
+                }
+            }
+            (!out.is_empty()).then_some(out)
+        })
+    }
+}
+
+// macOS：读取当前前台 App 的 pid 与 bundle id（NSWorkspace，无需额外权限）。
+// 必须在面板弹出瞬间调用，此时前台还是用户的目标 App。
+#[cfg(target_os = "macos")]
+fn capture_frontmost_app() -> FrontApp {
+    mac_front::frontmost_app()
+}
+
+// macOS：当前前台 App 的 bundle id（粘贴前轮询验证焦点是否已还回目标 App）。
+#[cfg(target_os = "macos")]
+fn frontmost_bundle() -> Option<String> {
+    mac_front::frontmost_app().bundle
+}
+
+// macOS：粘贴前把「面板弹出时的前台 App」显式激活回来。
+// 优先 NSRunningApplication.activate（按 pid，进程已退出则自然失败）；
+// 失败时回落 open -b（等价于 Cmd+Tab 切回）。
+// 前台是自己（设置窗口等场景）或无记录时不动作，退回 NSApplication.hide 的默认行为。
+// 返回激活目标的 bundle id；未发出激活请求时返回 None。
+// 注意激活是异步生效的（快则几十毫秒，跨 Space / 应用繁忙时可近一秒），
+// 调用方必须轮询验证前台已切换再模拟 ⌘V。
+#[cfg(target_os = "macos")]
+fn reactivate_prev_app(app: &AppHandle) -> Option<String> {
+    let prev = app
+        .state::<AppState>()
+        .prev_front_app
+        .lock()
+        .unwrap()
+        .clone();
+    let bundle = prev.bundle?;
+    if bundle == app.config().identifier {
+        return None;
+    }
+    let activated = prev.pid.map(mac_front::activate_pid).unwrap_or(false);
+    if !activated {
+        let _ = std::process::Command::new("open").args(["-b", &bundle]).status();
+    }
+    Some(bundle)
+}
+
+// macOS：粘贴链路调试日志（数据目录 lscopy-paste-debug.log，随配置文件同目录）。
+// 逐条记录每次粘贴的目标 App、前台轮询结果、AX 检测与最终决定，
+// 用于定位「⌘V 落进访达生成剪贴文件」类问题；文件超 256KB 自动清空重写。
+#[cfg(target_os = "macos")]
+fn paste_debug(app: &AppHandle, msg: &str) {
+    use std::io::Write;
+    let state = app.state::<AppState>();
+    let Some(dir) = state.config_file.lock().unwrap().parent().map(|d| d.to_path_buf()) else {
+        return;
+    };
+    let path = dir.join("lscopy-paste-debug.log");
+    let t = now_secs() + local_utc_offset(now_secs());
+    let line = format!(
+        "[{:02}:{:02}:{:02}] {}\n",
+        (t % 86400) / 3600,
+        (t % 3600) / 60,
+        t % 60,
+        msg
+    );
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > 256 * 1024 {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+// ---------- macOS 辅助功能权限 ----------
+
+/// 本进程是否已有「辅助功能」授权（AXIsProcessTrusted）
+#[cfg(target_os = "macos")]
+fn accessibility_trusted() -> bool {
+    #[link(name = "ApplicationServices", kind = "framework")]
+    extern "C" {
+        fn AXIsProcessTrusted() -> bool;
+    }
+    unsafe { AXIsProcessTrusted() }
+}
+
+/// 检查辅助功能权限；未授权时弹窗引导并打开系统设置页，返回 false。
+/// 注意：mac 上覆盖安装/更新后旧授权可能失效，需在设置里移除 lscopy 再重新添加。
+#[cfg(target_os = "macos")]
+fn ensure_accessibility(app: &AppHandle) -> bool {
+    if accessibility_trusted() {
+        return true;
+    }
+    let _ = std::process::Command::new("open")
+        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+        .spawn();
+    let app2 = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        app2.dialog()
+            .message("macOS 需要「辅助功能」权限才能模拟 ⌘V 粘贴。\n\n请在刚打开的系统设置中允许 lscopy。\n如果是更新/重装后失效：先在列表里移除 lscopy，再重新添加并打开开关。\n\n（剪贴板已更新，授权前可手动 ⌘V 粘贴）")
+            .title("需要辅助功能权限")
+            .blocking_show();
+    });
+    false
+}
+
+#[tauri::command]
+fn set_panel_pinned(state: State<AppState>, pinned: bool) {
+    state.panel_pinned.store(pinned, Ordering::SeqCst);
+}
+
+#[tauri::command]
+fn get_panel_pinned(state: State<AppState>) -> bool {
+    state.panel_pinned.load(Ordering::SeqCst)
+}
+
+// 开始拖动面板：置 dragging 标记，拖动造成的瞬时失焦不触发自动隐藏
+#[tauri::command]
+fn start_drag(app: AppHandle) {
+    let Some(win) = app.get_webview_window("main") else {
+        return;
+    };
+    app.state::<AppState>().dragging.store(true, Ordering::SeqCst);
+    let _ = win.start_dragging();
+    // 拖动是系统模态循环，前端收不到 mouseup，后端轮询左键松开后清除标记
+    std::thread::spawn(move || {
+        wait_left_button_released();
+        app.state::<AppState>().dragging.store(false, Ordering::SeqCst);
+    });
+}
+
+// 等待鼠标左键松开。若 150ms 内左键已不是按下状态，视为单击（未发生拖动），直接返回
+#[cfg(target_family = "windows")]
+fn wait_left_button_released() {
+    extern "system" {
+        fn GetAsyncKeyState(vk: i32) -> i16;
+    }
+    const VK_LBUTTON: i32 = 0x01;
+    let down = || unsafe { (GetAsyncKeyState(VK_LBUTTON) as u16) & 0x8000 != 0 };
+    let mut waited = 0;
+    while !down() && waited < 150 {
+        std::thread::sleep(Duration::from_millis(10));
+        waited += 10;
+    }
+    while down() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(not(target_family = "windows"))]
+fn wait_left_button_released() {
+    std::thread::sleep(Duration::from_secs(2));
+}
+
+#[tauri::command]
+fn paste_clip(state: State<AppState>, app: AppHandle, id: i64) -> Result<(), String> {
+    // 先立刻隐藏面板：点击的第一感知是面板消失，写剪贴板/模拟按键在后台完成
+    // 钉住时不隐藏，方便连续粘贴多条
+    if !state.panel_pinned.load(Ordering::SeqCst) {
+        hide_panel_and_yield_focus(&app);
+    }
+    // 剪贴板内容立即更新
+    set_clipboard_by_id_safe(&app, id)?;
+    *state.paste_file_mode.lock().unwrap() = false;
+    *state.paste_pending.lock().unwrap() = true;
+
+    // 已有粘贴 worker 在跑：标记排队即可，它完成后会立刻补下一次
+    if state.paste_running.swap(true, Ordering::SeqCst) {
+        return Ok(());
+    }
+    let app2 = app.clone();
+    std::thread::spawn(move || paste_worker(app2));
+    Ok(())
+}
+
+// 「粘贴文件」：把文件列表以 文件格式+纯文本路径 双格式写入剪贴板再模拟粘贴。
+// 聊天发送框/资源管理器/访达拿到文件本身；不支持文件的目标（文本框）拿到完整路径，
+// 即「粘贴不成功就粘贴地址」的兜底由双格式自动完成，无需检测粘贴结果。
+#[tauri::command]
+fn paste_clip_file(state: State<AppState>, app: AppHandle, id: i64) -> Result<(), String> {
+    // 先校验再动面板：文件已不存在等错误要原样弹在面板上，不能先隐藏
+    let paths: Vec<String> = {
+        let db = state.db.lock().unwrap();
+        let (kind, content) = db
+            .query_row(
+                "SELECT kind, content FROM clips WHERE id=?1",
+                params![id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+            .map_err(|e| e.to_string())?;
+        if kind != "file" {
+            return Err("该记录不是文件".to_string());
+        }
+        content
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.to_string())
+            .collect()
+    };
+    if paths.is_empty() {
+        return Err("文件路径为空".to_string());
+    }
+    if let Some(missing) = paths.iter().find(|p| !std::path::Path::new(p).exists()) {
+        return Err(format!("文件已不存在: {missing}"));
+    }
+    if !state.panel_pinned.load(Ordering::SeqCst) {
+        hide_panel_and_yield_focus(&app);
+    }
+    let text = paths.join("\n");
+    set_clipboard_files_safe(&app, &paths, &text)?;
+    *state.paste_file_mode.lock().unwrap() = true;
+    *state.paste_pending.lock().unwrap() = true;
+
+    if state.paste_running.swap(true, Ordering::SeqCst) {
+        return Ok(());
+    }
+    let app2 = app.clone();
+    std::thread::spawn(move || paste_worker(app2));
+    Ok(())
+}
+
+// 粘贴工作线程主体（独立函数便于重入）
+fn paste_worker(app: AppHandle) {
+    let state = app.state::<AppState>();
+    loop {
+        {
+            let mut p = state.paste_pending.lock().unwrap();
+            if !*p {
+                break;
+            }
+            *p = false;
+        }
+        // 取本次粘贴模式并复位（普通粘贴=文本/图片，文件粘贴=双格式写文件）
+        #[cfg(target_os = "macos")]
+        let file_mode = std::mem::replace(&mut *state.paste_file_mode.lock().unwrap(), false);
+        #[cfg(not(target_os = "macos"))]
+        let _file_mode_consumed =
+            std::mem::replace(&mut *state.paste_file_mode.lock().unwrap(), false);
+        // 面板已在 paste_clip 里隐藏，这里只需把焦点还给之前的窗口
+        let hwnd = *state.prev_hwnd.lock().unwrap();
+        if hwnd != 0 {
+            focus_hwnd(hwnd);
+        }
+        // macOS：没有辅助功能权限时模拟按键会被系统静默丢弃（不崩溃、不报错），
+        // 提前检查并引导授权，避免「光标回来了但内容没粘贴」
+        #[cfg(target_os = "macos")]
+        if !ensure_accessibility(&app) {
+            continue; // 剪贴板已更新，用户可手动 ⌘V
+        }
+        // macOS：把焦点显式还给「弹出面板时的前台 App」，不依赖
+        // NSApplication.hide 的「上一个 App」推断（它经常把访达激活到最前，
+        // ⌘V 会打进访达生成「文本剪贴」文件）
+        #[cfg(target_os = "macos")]
+        let reactivate_target = reactivate_prev_app(&app);
+        #[cfg(target_os = "macos")]
+        paste_debug(&app, &format!("paste begin, target={reactivate_target:?}"));
+        // 等焦点 settling：Windows 50ms 在响应速度和可靠性之间比较平衡
+        #[cfg(not(target_os = "macos"))]
+        std::thread::sleep(Duration::from_millis(50));
+        // macOS：激活是异步生效的，固定 sleep 不可靠——没切回去时 ⌘V 会落进
+        // 访达生成「文本剪贴」文件。轮询等前台真正切回目标 App（最多约 1s），
+        // 切回后再小等一段，让目标 App 内部的键盘焦点就位
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(target) = reactivate_target {
+                let mut confirmed = false;
+                let mut waited = 0;
+                for _ in 0..17 {
+                    std::thread::sleep(Duration::from_millis(60));
+                    waited += 60;
+                    if frontmost_bundle().as_deref() == Some(target.as_str()) {
+                        confirmed = true;
+                        break;
+                    }
+                }
+                if confirmed {
+                    paste_debug(&app, &format!("frontmost ok: {target} ({waited}ms)"));
+                    std::thread::sleep(Duration::from_millis(50));
+                } else {
+                    let now_front = frontmost_bundle();
+                    paste_debug(
+                        &app,
+                        &format!("frontmost timeout: target={target} actual={now_front:?}"),
+                    );
+                    if !file_mode && now_front.as_deref() == Some("com.apple.finder") {
+                        // 超时且前台仍是访达：⌘V 必生成剪贴文件，跳过模拟按键
+                        //（剪贴板已更新，用户可手动 ⌘V）。
+                        // 文件模式不拦截：粘贴文件到访达窗口是合法操作（复制进该文件夹）
+                        paste_debug(&app, "skip: finder frontmost");
+                        continue;
+                    }
+                }
+                // 超时但前台是其他 App：交给下面的 AX 可输入性检测兜底
+            } else {
+                // 无目标记录（前台是自己等场景）：退回 NSApp.hide 推断的 settling；
+                //  settling 后前台若是访达，⌘V 必生成剪贴文件，同样跳过
+                std::thread::sleep(Duration::from_millis(150));
+                let now_front = frontmost_bundle();
+                paste_debug(&app, &format!("no target, frontmost={now_front:?}"));
+                if !file_mode && now_front.as_deref() == Some("com.apple.finder") {
+                    paste_debug(&app, "skip: finder frontmost (no target)");
+                    continue;
+                }
+            }
+        }
+        // macOS：AX 焦点控件角色只做诊断记录，不再用于拦截（自定义渲染的编辑器如
+        // Sublime Text 焦点角色是容器角色，按角色拦截会误伤）。⌘V 落成「文本剪贴」
+        // 文件只有访达会干——发出前最后确认前台不是访达（NSWorkspace 检测是确定的）
+        #[cfg(target_os = "macos")]
+        {
+            let role = focused_element_role();
+            paste_debug(&app, &format!("ax role={role:?}"));
+            if !file_mode && frontmost_bundle().as_deref() == Some("com.apple.finder") {
+                paste_debug(&app, "skip: finder frontmost (final check)");
+                continue;
+            }
+            paste_debug(&app, &format!("simulate ⌘V (file_mode={file_mode})"));
+        }
+        simulate_paste_safe(&app);
+    }
+    state.paste_running.store(false, Ordering::SeqCst);
+    if *state.paste_pending.lock().unwrap() && !state.paste_running.swap(true, Ordering::SeqCst) {
+        let app2 = app.clone();
+        std::thread::spawn(move || paste_worker(app2));
+    }
+}
+
+fn range_where(range: &str, now: i64) -> String {
+    match range {
+        "1h" => format!("created_at >= {}", now - 3600),
+        "7d" => format!("created_at >= {}", now - 7 * 86400),
+        "30d" => format!("created_at >= {}", now - 30 * 86400),
+        "today" => {
+            let offset = local_utc_offset(now);
+            let midnight = now - ((now + offset) % 86400);
+            format!("created_at >= {midnight}")
+        }
+        _ => "1=1".to_string(), // all
+    }
+}
+
+#[tauri::command]
+fn count_pinned_in_range(state: State<AppState>, range: String) -> i64 {
+    let db = state.db.lock().unwrap();
+    let cond = range_where(&range, now_secs());
+    db.query_row(
+        &format!("SELECT COUNT(*) FROM clips WHERE pinned = 1 AND {cond}"),
+        [],
+        |r| r.get(0),
+    )
+    .unwrap_or(0)
+}
+
+#[tauri::command]
+fn delete_range(
+    state: State<AppState>,
+    app: AppHandle,
+    range: String,
+    include_pinned: bool,
+) -> Result<i64, String> {
+    ignore_current_clipboard(&state);
+    let db = state.db.lock().unwrap();
+    let cond = range_where(&range, now_secs());
+    let pinned_cond = if include_pinned { "1=1" } else { "pinned = 0" };
+    let affected = db.execute(
+        &format!("DELETE FROM clips WHERE {cond} AND {pinned_cond}"),
+        [],
+    );
+    drop(db);
+    let _ = app.emit("clip-added", ());
+    affected.map(|n| n as i64).map_err(|e| e.to_string())
+}
+
+// 自定义时间区间删除
+#[tauri::command]
+fn count_pinned_between(state: State<AppState>, start: i64, end: i64) -> i64 {
+    let db = state.db.lock().unwrap();
+    db.query_row(
+        "SELECT COUNT(*) FROM clips WHERE pinned = 1 AND created_at BETWEEN ?1 AND ?2",
+        params![start, end],
+        |r| r.get(0),
+    )
+    .unwrap_or(0)
+}
+
+#[tauri::command]
+fn delete_between(
+    state: State<AppState>,
+    app: AppHandle,
+    start: i64,
+    end: i64,
+    include_pinned: bool,
+) -> Result<i64, String> {
+    ignore_current_clipboard(&state);
+    let db = state.db.lock().unwrap();
+    let pinned_cond = if include_pinned { "1=1" } else { "pinned = 0" };
+    let affected = db.execute(
+        &format!("DELETE FROM clips WHERE created_at BETWEEN ?1 AND ?2 AND {pinned_cond}"),
+        params![start, end],
+    );
+    drop(db);
+    let _ = app.emit("clip-added", ());
+    affected.map(|n| n as i64).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn delete_clip(state: State<AppState>, app: AppHandle, id: i64) -> Result<(), String> {
+    ignore_current_clipboard(&state);
+    let db = state.db.lock().unwrap();
+    db.execute("DELETE FROM clips WHERE id=?1", params![id])
+        .map_err(|e| e.to_string())?;
+    drop(db);
+    let _ = app.emit("clip-added", ());
+    Ok(())
+}
+
+#[tauri::command]
+fn open_clip_with_system(
+    state: State<AppState>,
+    app: AppHandle,
+    id: i64,
+) -> Result<(), String> {
+    let (kind, content, img) = {
+        let db = state.db.lock().unwrap();
+        db.query_row(
+            "SELECT kind, content, image FROM clips WHERE id=?1",
+            params![id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<Vec<u8>>>(2)?,
+                ))
+            },
+        )
+        .map_err(|e| e.to_string())?
+    };
+
+    // 文字和图片先落盘到临时目录，文件直接用原路径
+    let path = match kind.as_str() {
+        "image" => {
+            let dir = std::env::temp_dir().join("lscopy");
+            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            let p = dir.join(format!("clip_{id}.png"));
+            std::fs::write(&p, img.ok_or("图片数据为空")?).map_err(|e| e.to_string())?;
+            p
+        }
+        "file" => {
+            let first = content
+                .unwrap_or_default()
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .ok_or("文件路径为空")?
+                .to_string();
+            PathBuf::from(first)
+        }
+        _ => {
+            let dir = std::env::temp_dir().join("lscopy");
+            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            let p = dir.join(format!("clip_{id}.txt"));
+            std::fs::write(&p, content.unwrap_or_default()).map_err(|e| e.to_string())?;
+            p
+        }
+    };
+
+    if !path.exists() {
+        return Err(format!("文件不存在: {}", path.display()));
+    }
+    app.opener()
+        .open_path(path.to_string_lossy().to_string(), None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_config(state: State<AppState>) -> AppConfig {
+    state.config.lock().unwrap().clone()
+}
+
+#[tauri::command]
+fn save_config(
+    app: AppHandle,
+    state: State<AppState>,
+    config: AppConfig,
+    config_dir_action: String,
+) -> Result<(), String> {
+    // 0. 开启「记住窗口大小」时，立即把当前面板实际尺寸写入配置
+    // （inner_size 是物理像素，换算成逻辑像素保存，与 Resized 落盘口径一致）
+    let mut config = config;
+    if config.remember_size {
+        if let Some(win) = app.get_webview_window("main") {
+            if let Ok(size) = win.inner_size() {
+                let scale = win.scale_factor().unwrap_or(1.0).max(0.5);
+                config.window_width = (size.width as f64 / scale).round() as u32;
+                config.window_height = (size.height as f64 / scale).round() as u32;
+            }
+        }
+    }
+
+    // 1. 数据库目录变更：打开新库并切换（旧库文件保留不删）
+    let old = state.config.lock().unwrap().clone();
+    if old.db_dir != config.db_dir {
+        let new_path = effective_db_path(&config);
+        let conn = init_db(&new_path)?;
+        let mut db = state.db.lock().unwrap();
+        *db = conn;
+    }
+
+    // 2. 配置文件目录变更：验证新目录可写 → 更新指针 → 切换，按选择处理旧文件
+    if old.config_dir != config.config_dir {
+        let new_file = effective_config_file(&config);
+        if let Some(dir) = new_file.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("创建配置目录失败：{}", e))?;
+        }
+        // 试写探测（只写不存在的临时文件，避免误覆盖）
+        let probe = new_file.with_extension("tmp");
+        std::fs::write(&probe, "{}").map_err(|e| format!("配置目录不可写：{}", e))?;
+        let _ = std::fs::remove_file(&probe);
+
+        let old_file = state.config_file.lock().unwrap().clone();
+        // 指针文件：空字符串表示默认（默认数据目录）
+        let pointer = config.config_dir.clone().unwrap_or_default();
+        let pointer_file = config_pointer_file();
+        if let Some(dir) = pointer_file.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("创建配置目录失败：{}", e))?;
+        }
+        std::fs::write(&pointer_file, pointer)
+            .map_err(|e| format!("保存配置目录设置失败：{}", e))?;
+        // 清理 exe 同目录的旧指针（mac 上位于 .app 包内，避免改写 bundle）
+        let legacy_pointer = exe_dir().join("lscopy-config-dir.txt");
+        if legacy_pointer != pointer_file {
+            let _ = std::fs::remove_file(legacy_pointer);
+        }
+        *state.config_file.lock().unwrap() = new_file.clone();
+        // 背景图（源图 + 烘焙缓存）跟随配置目录迁移：「保留旧副本」= 复制；
+        // 「迁移并删除」= 复制后删旧；「不迁移」则沿用新目录里已有的背景
+        if config_dir_action != "reset" && old_file != new_file {
+            if let (Some(old_dir), Some(new_dir)) = (old_file.parent(), new_file.parent()) {
+                let mut bg_files = bg_src_files(old_dir);
+                let cache = old_dir.join(BG_CACHE_NAME);
+                if cache.exists() {
+                    bg_files.push(cache);
+                }
+                for f in bg_files {
+                    if let Some(name) = f.file_name() {
+                        let _ = std::fs::copy(&f, new_dir.join(name));
+                        if config_dir_action == "move" {
+                            let _ = std::fs::remove_file(&f);
+                        }
+                    }
+                }
+            }
+        }
+        // 「迁移并删除旧文件」与「删除旧文件（不迁移）」都会删掉旧位置的配置文件
+        if config_dir_action != "keep" && old_file != new_file {
+            let _ = std::fs::remove_file(&old_file);
+        }
+        // 不迁移：新目录已有配置则直接采用，没有则生成一份全新默认配置；
+        // 表单里本次的其他改动一并丢弃（前端保存后会重新加载设置页）
+        if config_dir_action == "reset" {
+            let raw = std::fs::read_to_string(&new_file).ok();
+            let (mut loaded, lan_settings, relay_settings, lock_settings) =
+                load_config_full(raw.as_deref());
+            // config_dir 以本次指针为准，避免沿用新目录旧文件里记录的目录
+            loaded.config_dir = config.config_dir.clone();
+            // 新配置的数据库目录可能不同：切换数据库连接
+            let db_path = effective_db_path(&loaded);
+            let conn = init_db(&db_path)?;
+            *state.db.lock().unwrap() = conn;
+            *state.lan.settings.lock().unwrap() = lan_settings;
+            *state.relay.settings.lock().unwrap() = relay_settings;
+            *state.lock.lock().unwrap() = lock_settings;
+            config = loaded;
+        }
+    }
+
+    // 3. 重注册全局热键
+    register_hotkey(&app, &config.hotkey)?;
+
+    // 4. 应用开机自启
+    apply_autostart(&app, config.autostart);
+
+    // 5. 持久化 + 同步托盘开关 + 广播
+    if config.enabled {
+        // 从关闭切到开启时，忽略当前剪贴板内容（关闭期间的不补录）
+        ignore_current_clipboard(&state);
+    }
+    *state.config.lock().unwrap() = config.clone();
+    persist_config(&state)?;
+    if let Some(item) = state.tray_toggle.lock().unwrap().as_ref() {
+        let _ = item.set_checked(config.enabled);
+    }
+    // 窗口效果可能随配置整体保存而变化（主题明暗也影响 mica/亚克力配色），立即重应用
+    apply_window_effect_all(&app, &config.window_effect, config.theme != "light");
+    let _ = app.emit("config-changed", config);
+    Ok(())
+}
+
+// ---------- 窗口材质效果（亚克力 / 云母 / 苹果毛玻璃） ----------
+
+/// 给全部窗口应用窗口材质效果，可在窗口已显示时调用（立即生效）。
+/// effect: "default" | "acrylic" | "vibrancy" | "mica"；dark 决定材质明暗配色。
+/// 需要窗口在 tauri.conf.json 里开启 transparent，前端配合把背景改为半透明。
+fn apply_window_effect_all(app: &AppHandle, effect: &str, dark: bool) {
+    for label in ["main", "settings", "blocked", "transfer"] {
+        if let Some(win) = app.get_webview_window(label) {
+            apply_window_effect(&win, effect, dark);
+        }
+    }
+}
+
+/// 给单个窗口应用窗口材质效果。
+fn apply_window_effect(win: &tauri::WebviewWindow, effect: &str, dark: bool) {
+    #[cfg(target_os = "windows")]
+    {
+        // 先清掉旧效果再套新的（未应用过时 clear 无害）
+        let _ = window_vibrancy::clear_acrylic(win);
+        let _ = window_vibrancy::clear_mica(win);
+        let _ = window_vibrancy::clear_blur(win);
+        match effect {
+            "acrylic" => {
+                let color = if dark { (28, 28, 44, 140) } else { (240, 241, 245, 140) };
+                let _ = window_vibrancy::apply_acrylic(win, Some(color));
+            }
+            "mica" => {
+                let _ = window_vibrancy::apply_mica(win, Some(dark));
+            }
+            // 「苹果毛玻璃」：Windows 没有 Vibrancy，用 Blur 近似
+            "vibrancy" => {
+                let color = if dark { (22, 22, 34, 110) } else { (239, 241, 245, 110) };
+                let _ = window_vibrancy::apply_blur(win, Some(color));
+            }
+            _ => {} // default：仅清除
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = dark;
+        let _ = window_vibrancy::clear_vibrancy(win);
+        // 亚克力/云母在 mac 上没有对应材质，统一用 Vibrancy 呈现
+        let material = match effect {
+            "acrylic" => Some(window_vibrancy::NSVisualEffectMaterial::Sidebar),
+            "mica" => Some(window_vibrancy::NSVisualEffectMaterial::UnderWindowBackground),
+            "vibrancy" => Some(window_vibrancy::NSVisualEffectMaterial::HudWindow),
+            _ => None,
+        };
+        if let Some(m) = material {
+            let _ = window_vibrancy::apply_vibrancy(win, m, None, Some(10.0));
+        }
+    }
+}
+
+#[tauri::command]
+fn set_window_effect(app: AppHandle, state: State<AppState>, effect: String) -> Result<(), String> {
+    const VALID: [&str; 4] = ["default", "acrylic", "vibrancy", "mica"];
+    if !VALID.contains(&effect.as_str()) {
+        return Err(format!("未知的窗口效果: {effect}"));
+    }
+    let cfg = {
+        let mut c = state.config.lock().unwrap();
+        c.window_effect = effect;
+        c.clone()
+    };
+    persist_config(&state)?;
+    apply_window_effect_all(&app, &cfg.window_effect, cfg.theme != "light");
+    let _ = app.emit("config-changed", cfg);
+    Ok(())
+}
+
+// ---------- 面板背景图 ----------
+// 源图复制为配置目录下的 lscopy-bg-src.<ext>；设置页烘焙（旋转+选区）后的成品
+// 存为 lscopy-bg.png，主面板直接按 base64 读取应用。换目录时随配置文件一起迁移。
+
+const BG_SRC_STEM: &str = "lscopy-bg-src";
+const BG_CACHE_NAME: &str = "lscopy-bg.png";
+const BG_EXTS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "gif"];
+
+/// 背景图存放目录：跟随当前生效的配置文件所在目录
+fn bg_dir(state: &AppState) -> PathBuf {
+    state
+        .config_file
+        .lock()
+        .unwrap()
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(default_data_dir)
+}
+
+/// 目录下已存在的背景源图（按支持的扩展名枚举）
+fn bg_src_files(dir: &std::path::Path) -> Vec<PathBuf> {
+    BG_EXTS
+        .iter()
+        .map(|e| dir.join(format!("{BG_SRC_STEM}.{e}")))
+        .filter(|p| p.exists())
+        .collect()
+}
+
+#[derive(Serialize)]
+pub struct BgImageData {
+    b64: String,
+    mime: String,
+}
+
+/// 选择背景图：把源图复制进配置目录（换图后旧的烘焙缓存作废）
+#[tauri::command]
+fn import_background_source(state: State<AppState>, path: String) -> Result<(), String> {
+    let src = PathBuf::from(&path);
+    if !src.exists() {
+        return Err(format!("文件不存在: {path}"));
+    }
+    let ext = src
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_lowercase())
+        .unwrap_or_default();
+    if !BG_EXTS.contains(&ext.as_str()) {
+        return Err("仅支持 png / jpg / webp / bmp / gif 图片".into());
+    }
+    let size = std::fs::metadata(&src).map_err(|e| e.to_string())?.len();
+    if size > 30 * 1024 * 1024 {
+        return Err("图片过大（超过 30MB），请换一张".into());
+    }
+    let dir = bg_dir(&state);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    for f in bg_src_files(&dir) {
+        let _ = std::fs::remove_file(f);
+    }
+    let _ = std::fs::remove_file(dir.join(BG_CACHE_NAME));
+    std::fs::copy(&src, dir.join(format!("{BG_SRC_STEM}.{ext}")))
+        .map_err(|e| format!("复制图片失败: {e}"))?;
+    Ok(())
+}
+
+/// 读取背景源图（设置页重新编辑选区/旋转时回显用）
+#[tauri::command]
+fn read_background_source(state: State<AppState>) -> Option<BgImageData> {
+    let dir = bg_dir(&state);
+    let f = bg_src_files(&dir).into_iter().next()?;
+    let bytes = std::fs::read(&f).ok()?;
+    let mime = match f
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_lowercase()
+        .as_str()
+    {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "gif" => "image/gif",
+        _ => return None, // bg_src_files 只枚举已知扩展名，兜底防御
+    };
+    Some(BgImageData {
+        b64: B64.encode(bytes),
+        mime: mime.to_string(),
+    })
+}
+
+/// 保存设置页烘焙后的成品背景图（base64 PNG）
+#[tauri::command]
+fn save_background_cache(state: State<AppState>, b64: String) -> Result<(), String> {
+    let bytes = B64
+        .decode(b64)
+        .map_err(|e| format!("图片数据解码失败: {e}"))?;
+    if bytes.len() > 30 * 1024 * 1024 {
+        return Err("处理后的图片过大".into());
+    }
+    let dir = bg_dir(&state);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    std::fs::write(dir.join(BG_CACHE_NAME), bytes).map_err(|e| format!("写入背景图失败: {e}"))
+}
+
+/// 主面板读取烘焙后的背景图
+#[tauri::command]
+fn get_background_cache(state: State<AppState>) -> Option<String> {
+    std::fs::read(bg_dir(&state).join(BG_CACHE_NAME))
+        .ok()
+        .map(|b| B64.encode(b))
+}
+
+/// 保存背景图设置（即时落盘 + 广播，与 set_window_effect 同一模式）
+#[tauri::command]
+fn set_background_config(
+    app: AppHandle,
+    state: State<AppState>,
+    bg: BackgroundConfig,
+) -> Result<(), String> {
+    let cfg = {
+        let mut c = state.config.lock().unwrap();
+        c.background = bg;
+        c.clone()
+    };
+    persist_config(&state)?;
+    let _ = app.emit("config-changed", cfg);
+    Ok(())
+}
+
+/// 清除背景图：删除源图与缓存，并重置背景设置为默认
+#[tauri::command]
+fn clear_background_image(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    let dir = bg_dir(&state);
+    for f in bg_src_files(&dir) {
+        let _ = std::fs::remove_file(f);
+    }
+    let _ = std::fs::remove_file(dir.join(BG_CACHE_NAME));
+    let cfg = {
+        let mut c = state.config.lock().unwrap();
+        c.background = BackgroundConfig::default();
+        c.clone()
+    };
+    persist_config(&state)?;
+    let _ = app.emit("config-changed", cfg);
+    Ok(())
+}
+
+#[tauri::command]
+fn get_db_info(state: State<AppState>) -> DbInfo {
+    let cfg = state.config.lock().unwrap().clone();
+    let path = effective_db_path(&cfg);
+    let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    let db = state.db.lock().unwrap();
+    let q = |sql: &str| -> i64 { db.query_row(sql, [], |r| r.get(0)).unwrap_or(0) };
+    DbInfo {
+        path: path.to_string_lossy().to_string(),
+        file_size,
+        total: q("SELECT COUNT(*) FROM clips"),
+        text_count: q("SELECT COUNT(*) FROM clips WHERE kind='text'"),
+        image_count: q("SELECT COUNT(*) FROM clips WHERE kind='image'"),
+        pinned_count: q("SELECT COUNT(*) FROM clips WHERE pinned=1"),
+        max_items: cfg.max_items,
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct ExportClip {
+    kind: String,
+    content: Option<String>,
+    image_b64: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+    pinned: bool,
+    created_at: i64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ExportFile {
+    version: u32,
+    clips: Vec<ExportClip>,
+}
+
+#[tauri::command]
+fn export_clips(state: State<AppState>, path: String) -> Result<i64, String> {
+    let db = state.db.lock().unwrap();
+    let mut stmt = db
+        .prepare("SELECT kind, content, image, width, height, pinned, created_at FROM clips ORDER BY created_at")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| {
+            let img: Option<Vec<u8>> = r.get(2)?;
+            Ok(ExportClip {
+                kind: r.get(0)?,
+                content: r.get(1)?,
+                image_b64: img.map(|b| B64.encode(b)),
+                width: r.get(3)?,
+                height: r.get(4)?,
+                pinned: r.get::<_, i64>(5)? != 0,
+                created_at: r.get(6)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let clips: Vec<ExportClip> = rows.filter_map(|r| r.ok()).collect();
+    let count = clips.len() as i64;
+    let file = ExportFile { version: 1, clips };
+    let json = serde_json::to_string(&file).map_err(|e| e.to_string())?;
+    std::fs::write(&path, json).map_err(|e| e.to_string())?;
+    Ok(count)
+}
+
+#[tauri::command]
+fn import_clips(state: State<AppState>, path: String) -> Result<i64, String> {
+    let json = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let file: ExportFile = serde_json::from_str(&json).map_err(|e| format!("文件格式不正确: {e}"))?;
+    let max_items = state.config.lock().unwrap().max_items;
+    let db = state.db.lock().unwrap();
+    let mut count = 0i64;
+    for c in &file.clips {
+        let img = match &c.image_b64 {
+            Some(b64) => B64.decode(b64).ok(),
+            None => None,
+        };
+        let h = match (&c.content, &img) {
+            (Some(t), _) => hash_bytes(t.as_bytes()),
+            (None, Some(b)) => hash_bytes(b),
+            _ => 0,
+        };
+        // 相同内容已存在则跳过，避免导入产生重复
+        let exists = db
+            .query_row(
+                "SELECT 1 FROM clips WHERE hash = ?1 LIMIT 1",
+                params![h as i64],
+                |_| Ok(()),
+            )
+            .is_ok();
+        if exists {
+            continue;
+        }
+        let (py_full, py_abbr) = c.content.as_deref().map(pinyin_strings).unwrap_or_default();
+        let r = db.execute(
+            "INSERT INTO clips(kind, content, image, width, height, pinned, hash, created_at, pinyin_full, pinyin_abbr)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![c.kind, c.content, img, c.width, c.height, c.pinned as i64, h as i64, c.created_at, py_full, py_abbr],
+        );
+        if r.is_ok() {
+            count += 1;
+        }
+    }
+    prune(&db, max_items);
+    Ok(count)
+}
+
+#[tauri::command]
+fn list_system_fonts() -> Vec<String> {
+    #[cfg(target_family = "windows")]
+    {
+        use winreg::enums::HKEY_CURRENT_USER;
+        use winreg::enums::HKEY_LOCAL_MACHINE;
+        use winreg::RegKey;
+        let mut fonts = std::collections::BTreeSet::new();
+        for root in [HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER] {
+            if let Ok(key) = RegKey::predef(root)
+                .open_subkey(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts")
+            {
+                for (name, _) in key.enum_values().filter_map(|r| r.ok()) {
+                    let n = name
+                        .trim_end_matches(" (TrueType)")
+                        .trim_end_matches(" (OpenType)")
+                        .trim_end_matches(" (All res)")
+                        .trim()
+                        .to_string();
+                    if !n.is_empty() {
+                        fonts.insert(n);
+                    }
+                }
+            }
+        }
+        return fonts.into_iter().collect();
+    }
+    #[cfg(not(target_family = "windows"))]
+    {
+        vec![]
+    }
+}
+
+// 开关「剪贴板记录」的统一入口：托盘菜单 / 弹窗页 / 设置页共用
+fn set_recording_enabled(app: &AppHandle, enabled: bool) {
+    let state = app.state::<AppState>();
+    let cfg = {
+        let mut cfg = state.config.lock().unwrap();
+        cfg.enabled = enabled;
+        cfg.clone()
+    };
+    let _ = persist_config(&state);
+    if enabled {
+        // 关闭期间复制的内容不入库：开启瞬间忽略当前剪贴板内容
+        ignore_current_clipboard(&state);
+    }
+    if let Some(item) = state.tray_toggle.lock().unwrap().as_ref() {
+        let _ = item.set_checked(enabled);
+    }
+    let _ = app.emit("config-changed", cfg);
+}
+
+#[tauri::command]
+fn set_enabled(app: AppHandle, enabled: bool) {
+    set_recording_enabled(&app, enabled);
+}
+
+#[tauri::command]
+fn open_settings(app: AppHandle) {
+    present_window(&app, "settings");
+}
+
+// 打开黑名单管理窗口
+#[tauri::command]
+fn open_blocked(app: AppHandle) {
+    present_window(&app, "blocked");
+}
+
+// 打开互传文件窗口
+#[tauri::command]
+fn open_transfer(app: AppHandle) {
+    present_window(&app, "transfer");
+}
+
+// 本地 UTC 偏移（秒），用于"今天"的零点计算
+fn local_utc_offset(_now: i64) -> i64 {
+    #[cfg(target_family = "windows")]
+    unsafe {
+        #[repr(C)]
+        struct SYSTEMTIME {
+            w_year: u16,
+            w_month: u16,
+            w_dow: u16,
+            w_day: u16,
+            w_hour: u16,
+            w_min: u16,
+            w_sec: u16,
+            w_ms: u16,
+        }
+        #[repr(C)]
+        struct TIME_ZONE_INFORMATION {
+            bias: i32,
+            std_name: [u16; 32],
+            std_date: SYSTEMTIME,
+            std_bias: i32,
+            day_name: [u16; 32],
+            day_date: SYSTEMTIME,
+            day_bias: i32,
+        }
+        extern "system" {
+            fn GetTimeZoneInformation(tzi: *mut TIME_ZONE_INFORMATION) -> u32;
+        }
+        let mut tzi: TIME_ZONE_INFORMATION = std::mem::zeroed();
+        GetTimeZoneInformation(&mut tzi);
+        return -(tzi.bias as i64) * 60;
+    }
+    #[cfg(not(target_family = "windows"))]
+    {
+        0
+    }
+}
+
+// ---------- 热键解析 ----------
+
+fn code_from_name(name: &str) -> Option<Code> {
+    let n = name.trim();
+    let lower = n.to_lowercase();
+    match lower.as_str() {
+        "`" | "~" | "backquote" => return Some(Code::Backquote),
+        "space" => return Some(Code::Space),
+        "tab" => return Some(Code::Tab),
+        "enter" | "return" => return Some(Code::Enter),
+        "esc" | "escape" => return Some(Code::Escape),
+        "up" | "arrowup" => return Some(Code::ArrowUp),
+        "down" | "arrowdown" => return Some(Code::ArrowDown),
+        "left" | "arrowleft" => return Some(Code::ArrowLeft),
+        "right" | "arrowright" => return Some(Code::ArrowRight),
+        "backspace" => return Some(Code::Backspace),
+        "delete" | "del" => return Some(Code::Delete),
+        "home" => return Some(Code::Home),
+        "end" => return Some(Code::End),
+        "pageup" => return Some(Code::PageUp),
+        "pagedown" => return Some(Code::PageDown),
+        "-" | "minus" => return Some(Code::Minus),
+        "=" | "equal" => return Some(Code::Equal),
+        "," | "comma" => return Some(Code::Comma),
+        "." | "period" => return Some(Code::Period),
+        "/" | "slash" => return Some(Code::Slash),
+        "\\" | "backslash" => return Some(Code::Backslash),
+        ";" | "semicolon" => return Some(Code::Semicolon),
+        "'" | "quote" => return Some(Code::Quote),
+        "[" | "bracketleft" => return Some(Code::BracketLeft),
+        "]" | "bracketright" => return Some(Code::BracketRight),
+        _ => {}
+    }
+    if lower.len() == 1 {
+        let c = lower.chars().next().unwrap();
+        if ('a'..='z').contains(&c) {
+            return Some(match c {
+                'a' => Code::KeyA, 'b' => Code::KeyB, 'c' => Code::KeyC, 'd' => Code::KeyD,
+                'e' => Code::KeyE, 'f' => Code::KeyF, 'g' => Code::KeyG, 'h' => Code::KeyH,
+                'i' => Code::KeyI, 'j' => Code::KeyJ, 'k' => Code::KeyK, 'l' => Code::KeyL,
+                'm' => Code::KeyM, 'n' => Code::KeyN, 'o' => Code::KeyO, 'p' => Code::KeyP,
+                'q' => Code::KeyQ, 'r' => Code::KeyR, 's' => Code::KeyS, 't' => Code::KeyT,
+                'u' => Code::KeyU, 'v' => Code::KeyV, 'w' => Code::KeyW, 'x' => Code::KeyX,
+                'y' => Code::KeyY, 'z' => Code::KeyZ,
+                _ => unreachable!(),
+            });
+        }
+        if ('0'..='9').contains(&c) {
+            return Some(match c {
+                '0' => Code::Digit0, '1' => Code::Digit1, '2' => Code::Digit2,
+                '3' => Code::Digit3, '4' => Code::Digit4, '5' => Code::Digit5,
+                '6' => Code::Digit6, '7' => Code::Digit7, '8' => Code::Digit8,
+                '9' => Code::Digit9,
+                _ => unreachable!(),
+            });
+        }
+    }
+    if lower.len() >= 2 && lower.starts_with('f') {
+        if let Ok(n) = lower[1..].parse::<u32>() {
+            return Some(match n {
+                1 => Code::F1, 2 => Code::F2, 3 => Code::F3, 4 => Code::F4,
+                5 => Code::F5, 6 => Code::F6, 7 => Code::F7, 8 => Code::F8,
+                9 => Code::F9, 10 => Code::F10, 11 => Code::F11, 12 => Code::F12,
+                _ => return None,
+            });
+        }
+    }
+    None
+}
+
+fn parse_hotkey(s: &str) -> Option<Shortcut> {
+    let mut mods = Modifiers::empty();
+    let mut code: Option<Code> = None;
+    for part in s.split('+') {
+        match part.trim().to_lowercase().as_str() {
+            "ctrl" | "control" => mods |= Modifiers::CONTROL,
+            "shift" => mods |= Modifiers::SHIFT,
+            "alt" => mods |= Modifiers::ALT,
+            "win" | "super" | "meta" | "cmd" => mods |= Modifiers::SUPER,
+            other => code = code_from_name(other),
+        }
+    }
+    code.map(|c| Shortcut::new(Some(mods), c))
+}
+
+fn register_hotkey(app: &AppHandle, hotkey: &str) -> Result<(), String> {
+    let gs = app.global_shortcut();
+    let _ = gs.unregister_all();
+    if !office_plugin::allowed("ALLOW_GLOBAL_SHORTCUT") { return Ok(()); }
+    let sc = parse_hotkey(hotkey).ok_or_else(|| format!("无法识别的快捷键: {hotkey}"))?;
+    gs.register(sc)
+        .map_err(|e| format!("注册快捷键失败（可能与其他软件冲突）: {e}"))
+}
+
+fn apply_autostart(app: &AppHandle, enable: bool) {
+    if enable && !office_plugin::allowed("ALLOW_AUTOSTART") { return; }
+    let mgr = app.autolaunch();
+    let enabled = mgr.is_enabled().unwrap_or(false);
+    if enable && !enabled {
+        let _ = mgr.enable();
+    } else if !enable && enabled {
+        let _ = mgr.disable();
+    }
+}
+
+// ---------- 窗口/托盘 ----------
+
+// 隐藏主面板；macOS 上同时把焦点还给之前的 App：
+// mac 上单纯 win.hide() 不改变活跃 App（本进程仍是 frontmost，焦点回不到之前的文本框，
+// ⌘V 甚至会打进自己），NSApplication.hide() 才会让系统重新激活之前的前台应用。
+// 仅在设置/黑名单窗口都不可见时才隐藏整个 App，避免误伤其他窗口。
+fn hide_panel_and_yield_focus(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.hide();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let others_visible = ["settings", "blocked", "transfer"].iter().any(|l| {
+            app.get_webview_window(l)
+                .map(|w| w.is_visible().unwrap_or(false))
+                .unwrap_or(false)
+        });
+        if !others_visible {
+            let _ = app.hide();
+        }
+    }
+}
+
+#[tauri::command]
+fn hide_panel(app: AppHandle) {
+    hide_panel_and_yield_focus(&app);
+}
+
+/// 设置页切换窗口效果时调用：仅把主面板显示出来做实时预览，不抢焦点。
+/// 主面板是 alwaysOnTop，会直接浮在设置窗口上方，用户切换下拉即可实时看到效果。
+#[tauri::command]
+fn show_panel(app: AppHandle) {
+    if let Some(win) = app.get_webview_window("main") {
+        if !win.is_visible().unwrap_or(false) {
+            // 记住当前前台窗口，之后若在面板上粘贴能把焦点还回去
+            *app.state::<AppState>().prev_hwnd.lock().unwrap() = foreground_hwnd();
+            // macOS：同时记录前台 App（粘贴时显式激活回来）
+            #[cfg(target_os = "macos")]
+            {
+                let prev = capture_frontmost_app();
+                *app.state::<AppState>().prev_front_app.lock().unwrap() = prev;
+            }
+            clamp_window_into_visible(&win);
+            let _ = win.show();
+        }
+    }
+}
+
+fn toggle_window(app: &AppHandle) {
+    // 设置窗口已打开且被其他窗口遮挡（可见但未聚焦）时，按配置优先处理设置窗口：
+    // "front" = 提到最前面并聚焦；"close" = 关闭（隐藏，与设置窗口点 X 的行为一致）。
+    // 本轮不再切换主面板——主面板是 alwaysOnTop，同时弹出会正好盖住提到最前的设置窗口；
+    // 设置窗口聚焦 / 关闭后再按快捷键，恢复正常的面板呼出与隐藏。
+    if let Some(sw) = app.get_webview_window("settings") {
+        if sw.is_visible().unwrap_or(false) && !sw.is_focused().unwrap_or(false) {
+            let action = app
+                .state::<AppState>()
+                .config
+                .lock()
+                .unwrap()
+                .settings_hotkey_action
+                .clone();
+            if action == "close" {
+                let _ = sw.hide();
+            } else {
+                present_window(app, "settings");
+            }
+            return;
+        }
+    }
+    if let Some(win) = app.get_webview_window("main") {
+        if win.is_visible().unwrap_or(false) {
+            hide_panel_and_yield_focus(app);
+        } else {
+            // 记住弹出前的前台窗口，粘贴后把焦点还给它
+            *app.state::<AppState>().prev_hwnd.lock().unwrap() = foreground_hwnd();
+            // macOS：同时记录前台 App（粘贴时显式激活回来）
+            #[cfg(target_os = "macos")]
+            {
+                let prev = capture_frontmost_app();
+                *app.state::<AppState>().prev_front_app.lock().unwrap() = prev;
+            }
+            if app
+                .state::<AppState>()
+                .config
+                .lock()
+                .unwrap()
+                .follow_cursor_monitor
+            {
+                move_window_to_cursor_monitor(&win);
+            }
+            clamp_window_into_visible(&win);
+            let _ = win.show();
+            let _ = win.set_focus();
+            let _ = app.emit("panel-shown", ());
+        }
+    }
+}
+
+/// 显示器（物理像素坐标）是否包含某点
+fn monitor_contains(m: &tauri::window::Monitor, x: f64, y: f64) -> bool {
+    let p = m.position();
+    let s = m.size();
+    x >= p.x as f64
+        && x < (p.x + s.width as i32) as f64
+        && y >= p.y as f64
+        && y < (p.y + s.height as i32) as f64
+}
+
+/// 多显示器：唤起前把窗口挪到光标所在屏幕。
+/// 窗口中心已在该屏幕上则不挪动（尊重用户摆过的位置），否则居中到该屏幕。
+fn move_window_to_cursor_monitor(win: &tauri::WebviewWindow) {
+    let (Ok(cursor), Ok(monitors)) = (win.cursor_position(), win.available_monitors()) else {
+        return;
+    };
+    let Some(mon) = monitors
+        .iter()
+        .find(|m| monitor_contains(m, cursor.x, cursor.y))
+    else {
+        return;
+    };
+    let (Ok(wp), Ok(ws)) = (win.outer_position(), win.outer_size()) else {
+        return;
+    };
+    let cx = wp.x as f64 + ws.width as f64 / 2.0;
+    let cy = wp.y as f64 + ws.height as f64 / 2.0;
+    if monitor_contains(mon, cx, cy) {
+        return;
+    }
+    let mp = mon.position();
+    let ms = mon.size();
+    let nx = mp.x + (ms.width as i32 - ws.width as i32) / 2;
+    let ny = mp.y + (ms.height as i32 - ws.height as i32) / 2;
+    let _ = win.set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(
+        nx, ny,
+    )));
+}
+
+/// 多显示器：把窗口完整钳制回屏幕范围内。
+/// 以窗口中心所在显示器为准（不在任何屏上则回退主显示器）；
+/// 不同分辨率的屏幕之间移动后，任何一条边越界都拉回屏内，
+/// 窗口比屏幕还大时对齐屏幕左上原点（保证标题栏/拖动区域可及）。
+fn clamp_window_into_visible(win: &tauri::WebviewWindow) {
+    let (Ok(wp), Ok(ws)) = (win.outer_position(), win.outer_size()) else {
+        return;
+    };
+    let Ok(monitors) = win.available_monitors() else {
+        return;
+    };
+    let cx = wp.x as f64 + ws.width as f64 / 2.0;
+    let cy = wp.y as f64 + ws.height as f64 / 2.0;
+    let mon = match monitors.iter().find(|m| monitor_contains(m, cx, cy)) {
+        Some(m) => m.clone(),
+        None => match win.primary_monitor() {
+            Ok(Some(m)) => m,
+            _ => return,
+        },
+    };
+    let mp = mon.position();
+    let ms = mon.size();
+    // 窗口比屏幕宽/高时上限会小于下限，钳到屏幕原点
+    let max_x = (mp.x + ms.width as i32 - ws.width as i32).max(mp.x);
+    let max_y = (mp.y + ms.height as i32 - ws.height as i32).max(mp.y);
+    let nx = wp.x.clamp(mp.x, max_x);
+    let ny = wp.y.clamp(mp.y, max_y);
+    if nx != wp.x || ny != wp.y {
+        let _ = win.set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(
+            nx, ny,
+        )));
+    }
+}
+
+/// 统一展示窗口：开启「窗口跟随光标所在屏幕」时先挪到光标所在屏幕；
+/// 无论开关与否都钳制回屏内（多屏不同分辨率下不越界），再显示并聚焦。
+fn present_window(app: &AppHandle, label: &str) {
+    if let Some(w) = app.get_webview_window(label) {
+        if app.state::<AppState>().config.lock().unwrap().follow_cursor_monitor {
+            move_window_to_cursor_monitor(&w);
+        }
+        clamp_window_into_visible(&w);
+        let _ = w.show();
+        let _ = w.set_focus();
+    }
+}
+
+// ---------- 便携版应用内更新 ----------
+// NSIS 安装版走 tauri-plugin-updater 官方流程（NSIS 会装回注册表记录的原目录）；
+// 绿色便携版是单文件 exe，不能装到别处（配置/数据库都在 exe 同目录），这里实现
+// 「下载便携版 exe 到本目录 → 校验 SHA-256 → 退出后由 PowerShell 脚本替换并重启」。
+
+/// 判断当前是安装版还是便携版：注册表有 NSIS 卸载项即安装版
+#[tauri::command]
+fn update_install_kind() -> String {
+    #[cfg(target_family = "windows")]
+    {
+        use winreg::enums::*;
+        use winreg::RegKey;
+        for hive in [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE] {
+            for key in ["lscopy", "com.lsh.lscopy"] {
+                let path =
+                    format!("Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{key}");
+                if RegKey::predef(hive).open_subkey(&path).is_ok() {
+                    return "installed".to_string();
+                }
+            }
+        }
+        "portable".to_string()
+    }
+    #[cfg(not(target_family = "windows"))]
+    "installed".to_string()
+}
+
+/// 计算便携版 exe 的下载目标路径：默认 exe 同目录的 lscopy_new.exe（等替换）；
+/// 指定目录时为该目录下的 lscopy.exe（用户选择「下载到其他目录」）
+#[tauri::command]
+fn portable_update_begin(target_dir: Option<String>) -> Result<String, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe_dir = exe
+        .parent()
+        .ok_or("无法确定程序目录")?
+        .to_path_buf();
+    let (dir, name) = match target_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(d) => (std::path::PathBuf::from(d), "lscopy.exe"),
+        None => (exe_dir, "lscopy_new.exe"),
+    };
+    std::fs::create_dir_all(&dir).map_err(|e| format!("无法写入目录 {}: {e}", dir.display()))?;
+    let path = dir.join(name);
+    if path.exists() {
+        let _ = std::fs::remove_file(&path);
+    }
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// 解析可用的 HTTP 代理（返回 host:port）：GitHub 直连在国内常超时（os error 10060），
+/// 而浏览器走系统代理通常可用——ureq 默认不读系统代理，这里显式探测：
+/// 优先环境变量（HTTPS_PROXY / ALL_PROXY / HTTP_PROXY），Windows 再读系统代理注册表。
+fn detect_http_proxy() -> Option<String> {
+    for key in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+    ] {
+        if let Ok(v) = std::env::var(key) {
+            let v = v
+                .trim()
+                .trim_start_matches("http://")
+                .trim_start_matches("https://")
+                .trim_end_matches('/');
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    #[cfg(target_family = "windows")]
+    {
+        use winreg::enums::*;
+        use winreg::RegKey;
+        let key = RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings")
+            .ok()?;
+        let enabled: u32 = key.get_value("ProxyEnable").unwrap_or(0);
+        if enabled == 0 {
+            return None;
+        }
+        let server: String = key.get_value("ProxyServer").ok()?;
+        // ProxyServer 可能是 "host:port"，也可能是分协议的 "http=…;https=…;ftp=…"
+        let mut plain: Option<String> = None;
+        let mut any: Option<String> = None;
+        for part in server.split(';') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            match part.split_once('=') {
+                Some((scheme, addr)) => {
+                    let addr = addr.trim();
+                    if scheme.trim().eq_ignore_ascii_case("https") {
+                        return Some(addr.to_string());
+                    }
+                    if any.is_none() && !addr.is_empty() {
+                        any = Some(addr.to_string());
+                    }
+                }
+                None => plain = Some(part.to_string()),
+            }
+        }
+        plain.or(any)
+    }
+    #[cfg(not(target_family = "windows"))]
+    None
+}
+
+/// 更新下载专用 HTTP 客户端：显式超时（避免操作系统级长时间无响应）+ 环境/系统代理
+fn http_agent() -> ureq::Agent {
+    let mut builder = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(15))
+        .timeout_read(Duration::from_secs(60))
+        .timeout_write(Duration::from_secs(60));
+    if let Some(p) = detect_http_proxy() {
+        if let Ok(proxy) = ureq::Proxy::new(format!("http://{p}")) {
+            builder = builder.proxy(proxy);
+        }
+    }
+    builder.build()
+}
+
+/// 流式下载更新包到指定路径，进度通过 portable-update-progress 事件回传。
+/// GitHub 直连可能超时（os error 10060）：失败自动重试 3 次（间隔 2s / 5s），
+/// 每次从头下载（文件截断重建），代理由 http_agent 探测。
+#[tauri::command]
+async fn portable_update_download(app: AppHandle, url: String, path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        use std::io::{Read, Write};
+        let mut last_err = String::new();
+        for attempt in 1..=3u32 {
+            if attempt > 1 {
+                std::thread::sleep(Duration::from_secs(if attempt == 2 { 2 } else { 5 }));
+                // 重试时进度归零，前端进度条重新起步
+                let _ = app.emit(
+                    "portable-update-progress",
+                    serde_json::json!({ "sent": 0u64, "total": 0u64 }),
+                );
+            }
+            let result = (|| -> Result<(), String> {
+                let resp = http_agent()
+                    .get(&url)
+                    .call()
+                    .map_err(|e| format!("连接失败: {e}"))?;
+                let total: u64 = resp
+                    .header("content-length")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                let mut reader = resp.into_reader();
+                let mut file = std::fs::File::create(&path)
+                    .map_err(|e| format!("无法创建文件 {path}: {e}"))?;
+                let mut buf = [0u8; 65536];
+                let mut sent: u64 = 0;
+                loop {
+                    let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
+                    if n == 0 {
+                        break;
+                    }
+                    file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+                    sent += n as u64;
+                    let _ = app.emit(
+                        "portable-update-progress",
+                        serde_json::json!({ "sent": sent, "total": total }),
+                    );
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => return Ok(()),
+                Err(e) => last_err = format!("{e}（第 {attempt}/3 次）"),
+            }
+        }
+        Err(format!("下载失败（已重试 3 次）：{last_err}"))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 拉取文本资源（用于读取 Release 的 sha256sums 校验文件），与下载同一套代理/超时/重试
+#[tauri::command]
+async fn http_get_text(url: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut last_err = String::new();
+        for attempt in 1..=3u32 {
+            if attempt > 1 {
+                std::thread::sleep(Duration::from_secs(2));
+            }
+            match http_agent()
+                .get(&url)
+                .call()
+                .map_err(|e| format!("请求失败: {e}"))
+                .and_then(|r| r.into_string().map_err(|e| e.to_string()))
+            {
+                Ok(text) => return Ok(text),
+                Err(e) => last_err = format!("{e}（第 {attempt}/3 次）"),
+            }
+        }
+        Err(last_err)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 校验下载文件的 SHA-256（与 Release 的 sha256sums 比对，防止下载损坏/被篡改）
+#[tauri::command]
+fn portable_update_verify(path: String, expected_sha256: String) -> Result<bool, String> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+    let digest = Sha256::digest(&bytes);
+    let got: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    Ok(got.eq_ignore_ascii_case(expected_sha256.trim()))
+}
+
+/// 退出本进程，由辅助进程等待退出后替换 exe 并重启新版。
+/// 辅助进程 = 自身 exe 拷到 %TEMP% 的副本：GUI 子系统天然无控制台窗口。
+/// （早期版本用 PowerShell 脚本，powershell.exe 是控制台程序，CREATE_NO_WINDOW
+/// 在 Windows Terminal 作为默认终端时仍会弹窗，故弃用。）
+#[tauri::command]
+fn portable_update_apply(app: AppHandle, new_path: String) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let helper = std::env::temp_dir().join("lscopy-updater.exe");
+    std::fs::copy(&exe, &helper).map_err(|e| format!("创建更新辅助程序失败: {e}"))?;
+    let mut cmd = std::process::Command::new(&helper);
+    cmd.arg("--apply-update").arg(&new_path).arg(&exe);
+    if let Some(dir) = exe.parent() {
+        cmd.current_dir(dir);
+    }
+    cmd.spawn().map_err(|e| format!("启动更新辅助程序失败: {e}"))?;
+    app.exit(0);
+    Ok(())
+}
+
+/// 便携版更新辅助进程入口：等旧进程退出（exe 文件锁释放）后用新 exe 覆盖旧 exe，
+/// 再启动新版。运行在 %TEMP% 的副本上，与替换的源/目标路径都不冲突。
+/// 仅 Windows 便携版使用（macOS 走官方 updater）。
+#[cfg(windows)]
+fn apply_update_helper(new_path: &str, old_path: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        match std::fs::rename(new_path, old_path) {
+            Ok(_) => break,
+            // 旧进程未退出时目标 exe 被占用，rename 失败，稍候重试
+            Err(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(400))
+            }
+            // 超时放弃：新 exe 保留在原位，用户可手动替换
+            Err(_) => return,
+        }
+    }
+    let mut cmd = std::process::Command::new(old_path);
+    if let Some(dir) = std::path::Path::new(old_path).parent() {
+        cmd.current_dir(dir);
+    }
+    let _ = cmd.spawn();
+}
+
+// ---------- 安装版应用内更新（Windows NSIS） ----------
+// 不用官方 updater 静默安装：先把安装包流式下载到系统「下载」目录（好找、可留档），
+// 校验 SHA-256 后由用户确认运行安装程序（NSIS 会装回注册表记录的原目录）。
+// 下载/校验复用便携版的 portable_update_download / portable_update_verify。
+
+/// 安装包的下载目标路径：系统「下载」目录下的安装包文件
+#[tauri::command]
+fn installer_update_path(filename: String) -> Result<String, String> {
+    let dir = dirs::download_dir().ok_or("找不到系统下载目录")?;
+    let path = dir.join(filename);
+    if path.exists() {
+        let _ = std::fs::remove_file(&path);
+    }
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// 运行下载好的 NSIS 安装包并退出本程序（安装程序装回原目录后会重启新版）
+#[tauri::command]
+fn installer_update_run(app: AppHandle, path: String) -> Result<(), String> {
+    std::process::Command::new(&path)
+        .spawn()
+        .map_err(|e| format!("启动安装程序失败: {e}"))?;
+    app.exit(0);
+    Ok(())
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    #[cfg(windows)]
+    {
+        let args: Vec<String> = std::env::args().collect();
+        // 便携版更新辅助进程：--apply-update <new_exe> <old_exe>，跑完即退，
+        // 不进入 Tauri 初始化（避免单实例插件把它拦下）
+        if args.len() >= 4 && args[1] == "--apply-update" {
+            apply_update_helper(&args[2], &args[3]);
+            return;
+        }
+        // 正常启动时顺手清理上次更新遗留的临时辅助程序副本（可能仍被占用，失败无碍）
+        let _ = std::fs::remove_file(std::env::temp_dir().join("lscopy-updater.exe"));
+    }
+    tauri::Builder::default()
+        // 单实例：重复启动时提示并聚焦已有窗口
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            app.dialog()
+                .message("共享剪贴板已经在运行中，可通过托盘图标或快捷键呼出。")
+                .title("提示")
+                .blocking_show();
+            present_window(app, "main");
+        }))
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_process::init())
+        // 应用内更新：检查 GitHub Release 的 latest.json，下载并安装新版本
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec![]),
+        ))
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, _shortcut, event| {
+                    if event.state() == tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                        toggle_window(app);
+                    }
+                })
+                .build(),
+        )
+        .setup(|app| {
+            // 配置文件默认在 default_data_dir()（Windows 便携模式 = exe 同目录；
+            // macOS = ~/Library/Application Support/com.lsh.lscopy，因为更新会整体替换
+            // .app，包内数据每次更新都会丢），实际目录由指针文件 lscopy-config-dir.txt
+            // 决定（可在设置里自定义）。旧版本配置在系统配置目录：首次启动自动迁移过来
+            let config_file = current_config_file();
+            // 配置目录被抹掉时（如 macOS 更新整体替换 .app、自定义目录选在包内），
+            // 从默认数据目录的镜像恢复上次配置，更新后无需重配数据库/配置文件目录
+            if !config_file.exists() {
+                let mirror = default_data_dir().join("lscopy-config.json");
+                if mirror != config_file && mirror.exists() {
+                    if let Some(dir) = config_file.parent() {
+                        let _ = std::fs::create_dir_all(dir);
+                    }
+                    let _ = std::fs::copy(&mirror, &config_file);
+                }
+            }
+            if !config_file.exists() {
+                let legacy = app
+                    .path()
+                    .app_config_dir()
+                    .map_err(|e| e.to_string())?
+                    .join("lscopy-config.json");
+                if legacy.exists() && legacy != config_file {
+                    let _ = std::fs::copy(&legacy, &config_file);
+                }
+            }
+            // mac 过渡兜底：旧版本配置/数据库可能在 .app 包内（exe 同目录），
+            // 新默认位置没有时拷过来（更新场景旧 bundle 已被替换，查不到也无害）
+            if !config_file.exists() {
+                let in_bundle = exe_dir().join("lscopy-config.json");
+                if in_bundle != config_file && in_bundle.exists() {
+                    let _ = std::fs::copy(&in_bundle, &config_file);
+                }
+            }
+            let raw = std::fs::read_to_string(&config_file).ok();
+            let (config, lan_settings, relay_settings, mut lock_settings) = load_config_full(raw.as_deref());
+            // 自愈：enabled=true 但没有任何凭证（旧配置/异常写入）会导致启动即锁定
+            // 且永远无法解锁，一律按未启用处理
+            if lock_settings.enabled && !lock_settings.effective() {
+                lock_settings = lock::LockSettings::default();
+            }
+            let db_path = effective_db_path(&config);
+            if !db_path.exists() {
+                let in_bundle_db = exe_dir().join("lscopy.db");
+                if in_bundle_db != db_path && in_bundle_db.exists() {
+                    if let Some(dir) = db_path.parent() {
+                        let _ = std::fs::create_dir_all(dir);
+                    }
+                    let _ = std::fs::copy(&in_bundle_db, &db_path);
+                }
+            }
+            let db = init_db(&db_path)?;
+            // 启用了安全锁定时：启动即处于锁定状态（各窗口被锁定遮罩覆盖，解锁后可用）
+            let start_locked = lock_settings.enabled;
+            app.manage(AppState {
+                db: Mutex::new(db),
+                config: Mutex::new(config.clone()),
+                config_file: Mutex::new(config_file),
+                ignored_hashes: Mutex::new(Vec::new()),
+                last_seen: Mutex::new(0),
+                tray_toggle: Mutex::new(None),
+                tray_lock: Mutex::new(None),
+                lock: Mutex::new(lock_settings),
+                locked: AtomicBool::new(start_locked),
+                unlock_epoch: Mutex::new(now_secs()),
+                paste_pending: Mutex::new(false),
+                paste_running: AtomicBool::new(false),
+                paste_file_mode: Mutex::new(false),
+                prev_hwnd: Mutex::new(0),
+                #[cfg(target_os = "macos")]
+                prev_front_app: Mutex::new(FrontApp::default()),
+                panel_pinned: AtomicBool::new(false),
+                dragging: AtomicBool::new(false),
+                main_focused: AtomicBool::new(false),
+                pending_size: Mutex::new(None),
+                lan: lan::LanShared::new(lan_settings),
+                relay: relay::RelayShared::new(relay_settings),
+            });
+            // 统一为合并格式落盘一次（旧格式/旧局域网文件 → 新 ConfigFile）
+            {
+                let state = app.state::<AppState>();
+                let _ = persist_config(&state);
+            }
+            // 旧版独立局域网配置文件：迁移后备份为 .bak
+            let old_lan = exe_dir().join("lscopy-lan.json");
+            if old_lan.exists() {
+                let _ = std::fs::rename(&old_lan, old_lan.with_extension("json.bak"));
+            }
+
+            // 托盘
+            let show = MenuItem::with_id(app, "show", "显示面板", true, None::<&str>)?;
+            let toggle = CheckMenuItem::with_id(app, "toggle", "开启剪贴板记录", true, config.enabled, None::<&str>)?;
+            let transfer = MenuItem::with_id(app, "transfer", "互传文件", true, None::<&str>)?;
+            let lock_item = MenuItem::with_id(app, "lock", "立即锁定", start_locked, None::<&str>)?;
+            let settings = MenuItem::with_id(app, "settings", "设置", true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show, &toggle, &transfer, &lock_item, &settings, &quit])?;
+            TrayIconBuilder::new()
+                .icon(app.default_window_icon().unwrap().clone())
+                .menu(&menu)
+                .tooltip(format!("共享剪贴板 ({})", format_hotkey_display(&config.hotkey)))
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "show" => toggle_window(app),
+                    "toggle" => {
+                        let current = app.state::<AppState>().config.lock().unwrap().enabled;
+                        set_recording_enabled(app, !current);
+                    }
+                    "settings" => present_window(app, "settings"),
+                    "transfer" => present_window(app, "transfer"),
+                    "lock" => lock::set_locked(app, true),
+                    "quit" => app.exit(0),
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    // 只响应左键松开；右键留给系统弹菜单，避免窗口焦点变化把菜单闪掉
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        toggle_window(tray.app_handle());
+                    }
+                })
+                .build(app)?;
+
+            // 托盘开关存入状态，供其他界面同步勾选
+            *app.state::<AppState>().tray_toggle.lock().unwrap() = Some(toggle);
+            // 托盘「立即锁定」菜单项存入状态，随锁定设置启停
+            *app.state::<AppState>().tray_lock.lock().unwrap() = Some(lock_item);
+
+            // 全局热键（默认 Ctrl+`）
+            register_hotkey(app.handle(), &config.hotkey)?;
+
+            // 开机自启状态同步
+            apply_autostart(app.handle(), config.autostart);
+
+            // 主窗口：关闭改隐藏；失焦自动关闭（点其他位置即关闭）
+            if let Some(win) = app.get_webview_window("main") {
+                // 记住窗口大小：启动时恢复上次尺寸。
+                // 一律按逻辑像素（DPI 无关）保存/恢复：物理像素在缩放比不同的多显示器
+                // 之间不稳定——窗口跨屏移动时系统按新 DPI 重算物理尺寸，存物理值会导致
+                // 换屏 / 重启后视觉大小漂移（实测：150% 副屏调的 1052x1439 物理 = 701x959
+                // 逻辑，落到 100% 主屏按物理恢复会变成逻辑 1052x1439，视觉大 1.5 倍）。
+                if config.remember_size && config.window_width > 0 && config.window_height > 0 {
+                    let (mut w, mut h) = (config.window_width, config.window_height);
+                    // 钳制到当前显示器逻辑尺寸内：旧配置存的是物理像素、或窗口从大屏
+                    // 换到小屏时，避免恢复出比屏幕还大的窗口（用户重调一次即长期稳定）
+                    if let Ok(Some(mon)) = win.current_monitor() {
+                        let scale = mon.scale_factor();
+                        let mw = (mon.size().width as f64 / scale) as u32;
+                        let mh = (mon.size().height as f64 / scale) as u32;
+                        w = w.min(mw);
+                        h = h.min(mh);
+                    }
+                    let _ = win.set_size(tauri::LogicalSize::new(w as f64, h as f64));
+                }
+                // 启动时应用配置的窗口材质效果（默认不透明则无操作）
+                apply_window_effect_all(app.handle(), &config.window_effect, config.theme != "light");
+                let w = win.clone();
+                win.on_window_event(move |event| match event {
+                    WindowEvent::CloseRequested { api, .. } => {
+                        api.prevent_close();
+                        hide_panel_and_yield_focus(w.app_handle());
+                    }
+                    WindowEvent::Resized(size) => {
+                        // 记住窗口大小开启时：暂存新尺寸，由监听线程统一落盘。
+                        // Resized 给的是物理像素，换算成逻辑像素再存——跨 DPI 移动窗口时
+                        // 系统会重算物理尺寸（保持逻辑尺寸），存逻辑值则保存结果始终稳定
+                        let state = w.state::<AppState>();
+                        if state.config.lock().unwrap().remember_size {
+                            let scale = w.scale_factor().unwrap_or(1.0).max(0.5);
+                            let lw = (size.width as f64 / scale).round() as u32;
+                            let lh = (size.height as f64 / scale).round() as u32;
+                            *state.pending_size.lock().unwrap() = Some((lw, lh));
+                        }
+                    }
+                    WindowEvent::Focused(focused) => {
+                        let state = w.state::<AppState>();
+                        state.main_focused.store(*focused, Ordering::SeqCst);
+                        if *focused {
+                            return;
+                        }
+                        // 失焦延迟复查：拖动/缩放是系统模态操作，会造成瞬时失焦；
+                        // 等 150ms 确认仍无焦点、未钉住、未在拖动，才真正隐藏
+                        let w2 = w.clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(Duration::from_millis(150));
+                            let st = w2.state::<AppState>();
+                            if st.panel_pinned.load(Ordering::SeqCst) {
+                                return;
+                            }
+                            if st.dragging.load(Ordering::SeqCst) {
+                                return;
+                            }
+                            if st.main_focused.load(Ordering::SeqCst) {
+                                return;
+                            }
+                            hide_panel_and_yield_focus(w2.app_handle());
+                        });
+                    }
+                    _ => {}
+                });
+                // 非静默启动时显示主窗口
+                if !config.silent_start {
+                    let _ = win.show();
+                    let _ = win.set_focus();
+                }
+            }
+
+            // 设置窗口：关闭改隐藏，便于再次快速打开
+            if let Some(win) = app.get_webview_window("settings") {
+                let w = win.clone();
+                win.on_window_event(move |event| {
+                    if let WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = w.hide();
+                    }
+                });
+            }
+
+            // 黑名单窗口：关闭改隐藏
+            if let Some(win) = app.get_webview_window("blocked") {
+                let w = win.clone();
+                win.on_window_event(move |event| {
+                    if let WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = w.hide();
+                    }
+                });
+            }
+
+            // 互传文件窗口：关闭改隐藏
+            if let Some(win) = app.get_webview_window("transfer") {
+                let w = win.clone();
+                win.on_window_event(move |event| {
+                    if let WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = w.hide();
+                    }
+                });
+            }
+
+            // 启动剪贴板监听线程
+            start_watcher(app.handle().clone());
+            // 启动局域网同步模块（beacon 收发 + 自动同步，按开关启停 HTTP 服务）
+            lan::start(app.handle());
+            // 启动云端中继客户端（按配置连接，未启用时空转等待）
+            relay::start(app.handle());
+            // 启动安全锁定模块（自动锁定计时线程）
+            lock::start(app.handle());
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            list_clips,
+            toggle_pin,
+            copy_clip,
+            paste_clip,
+            paste_clip_file,
+            hide_panel,
+            count_pinned_in_range,
+            delete_range,
+            delete_clip,
+            get_config,
+            save_config,
+            set_window_effect,
+            import_background_source,
+            read_background_source,
+            save_background_cache,
+            get_background_cache,
+            set_background_config,
+            clear_background_image,
+            show_panel,
+            get_db_info,
+            export_clips,
+            import_clips,
+            open_settings,
+            open_blocked,
+            open_transfer,
+            list_system_fonts,
+            open_clip_with_system,
+            count_pinned_between,
+            delete_between,
+            set_enabled,
+            get_clip_image,
+            set_panel_pinned,
+            get_panel_pinned,
+            start_drag,
+            lan::lan_get_state,
+            lan::lan_update_settings,
+            lan::lan_regenerate_token,
+            lan::lan_add_device,
+            lan::lan_sweep,
+            lan::lan_pair,
+            lan::lan_unpair,
+            lan::lan_forget_device,
+            lan::lan_sync_now,
+            lan::lan_block,
+            lan::lan_unblock,
+            lan::lan_respond_pair,
+            relay::relay_get_state,
+            relay::relay_update_settings,
+            lan::transfer::transfer_send,
+            lan::transfer::transfer_send_ip,
+            lan::transfer::transfer_cancel,
+            lan::transfer::transfer_respond_recv,
+            lan::transfer::transfer_respond_batch,
+            lan::transfer::transfer_history,
+            lan::transfer::transfer_delete,
+            lan::transfer::transfer_clear_history,
+            lan::transfer::transfer_reveal,
+            lan::transfer::transfer_open_dir,
+            update_install_kind,
+            portable_update_begin,
+            portable_update_download,
+            portable_update_verify,
+            portable_update_apply,
+            installer_update_path,
+            installer_update_run,
+            http_get_text,
+            lock::lock_get_status,
+            lock::lock_set_password,
+            lock::lock_set_shortcut,
+            lock::lock_unlock,
+            lock::lock_now,
+            lock::lock_set_auto_lock,
+            lock::lock_disable,
+            lock::lock_reset
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}

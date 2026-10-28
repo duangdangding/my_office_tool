@@ -1,0 +1,37 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Tauri / Rust
+src-tauri/target/
+src-tauri/gen/schemas
+
+# 局域网同步参考代码（安卓端，仅开发参考用）
+.reference/
+# 局域网同步的本地状态文件（便携模式下生成于 exe 同目录）
+lscopy-lan.json
+lan-files/
+
+# 界面验证临时产物
+.preview/

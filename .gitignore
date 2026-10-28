@@ -1,0 +1,10 @@
+node_modules/
+dist/
+src-tauri/target/
+.office-toolbox/
+.generated/
+**/node_modules/
+**/dist/
+**/target/
+*.log
+.DS_Store

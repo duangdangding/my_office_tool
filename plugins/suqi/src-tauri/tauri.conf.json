@@ -1,0 +1,53 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "速启",
+  "version": "0.16.6",
+  "identifier": "com.suqi.launcher",
+  "build": {
+    "beforeDevCommand": "bun run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "bun run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "windows": [{
+      "label": "main",
+      "title": "速启",
+      "width": 980,
+      "height": 680,
+      "minWidth": 700,
+      "minHeight": 500,
+      "resizable": true,
+      "visible": false
+    }, {
+      "label": "settings",
+      "title": "速启设置",
+      "url": "settings.html",
+      "width": 720,
+      "height": 560,
+      "minWidth": 480,
+      "minHeight": 400,
+      "resizable": true,
+      "visible": false
+    }],
+    "security": {
+      "csp": null,
+      "assetProtocol": { "enable": true, "scope": ["**"] }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "nsis",
+    "icon": ["icons/icon.ico"],
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "active": true,
+      "endpoints": ["https://github.com/duangdangding/ls_quick_start/releases/latest/download/latest.json"],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDg2RjYxNjIyN0E1MzE0RjgKUldUNEZGTjZJaGIyaHIzSmVjSDUxWTBaUW42ZHljR1BiR1ZsVHl0SzA3cEQ3UmRaanJFQmZhb00K",
+      "windows": { "installMode": "passive" }
+    }
+  }
+}

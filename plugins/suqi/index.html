@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>速启</title>
+    <!-- 首屏底色：JS/CSS 加载前先铺主题背景色，避免 WebView 默认白底闪烁（与默认深色主题一致，跟随系统浅色偏好） -->
+    <style>
+      html, body { background: #1e1e2e; }
+      @media (prefers-color-scheme: light) { html, body { background: #f4f4f8; } }
+    </style>
+  </head>
+  <body>
+    <main id="app">
+      <!-- 首屏骨架：结构与 render() 输出一致，JS 就绪前即显示面板框架，数据加载完成后由 render() 整体替换 -->
+      <section class="shell">
+        <header>
+          <div class="brand">速启 <small>Quick Launch</small></div>
+          <label class="search"><span>⌕</span><input disabled placeholder="搜索关键字、名称或拼音" /></label>
+          <button class="primary" disabled>＋ 添加</button>
+          <button disabled>扫描导入</button>
+          <button disabled title="还原启动项到文件夹">还原</button>
+          <button disabled>管理</button>
+          <button disabled title="设置">⚙</button>
+          <button disabled title="钉住面板">📍</button>
+        </header>
+        <nav id="tabs">
+          <button class="tab active" disabled>全部</button>
+          <button class="tab" disabled>未分组</button>
+          <button class="tab lock" disabled>🔒加密</button>
+        </nav>
+        <section class="toolbar"><span><i class="loading-dot"></i>正在加载…</span></section>
+        <section id="grid" class="grid"></section>
+        <footer>右键空白处即可添加 · Enter 打开 · 方向键切换</footer>
+      </section>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,297 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Windows：默认构建（无 --target），产物在 target/release 下
+          - os: windows-latest
+            id: win
+            target: ""
+            arch: x64
+            bundle: src-tauri/target/release/bundle
+          # macOS Apple Silicon：在 macos-latest（arm64）上原生构建
+          - os: macos-latest
+            id: mac-arm64
+            target: ""
+            arch: arm64
+            bundle: src-tauri/target/release/bundle
+          # macOS Intel：GitHub 已退役 Intel 构建机（macos-13），
+          # 在 Apple Silicon 机器上交叉编译 x86_64 目标
+          - os: macos-latest
+            id: mac-x86_64
+            target: x86_64-apple-darwin
+            arch: x86_64
+            bundle: src-tauri/target/x86_64-apple-darwin/release/bundle
+    runs-on: ${{ matrix.os }}
+    env:
+      # 用于条件判断：secrets 不能出现在 if: 里，先映射到 job 级 env
+      WINDOWS_CERT_PFX: ${{ secrets.WINDOWS_CERT_PFX }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # macOS Intel 需要额外安装交叉编译目标
+      - name: Add Rust target
+        if: matrix.target != ''
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Install frontend dependencies
+        run: bun install
+
+      # Windows 代码签名：仅在配置了 WINDOWS_CERT_PFX secret 时启用。
+      # 解出证书文件并向 tauri.conf.json 注入 bundle.windows.signCommand，
+      # Tauri 打包时会用它给 exe / NSIS 安装包逐个签名。
+      - name: Prepare Windows code signing
+        if: matrix.id == 'win' && env.WINDOWS_CERT_PFX != ''
+        shell: pwsh
+        env:
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          $certPath = "$env:RUNNER_TEMP\suqi-cert.pfx"
+          [IO.File]::WriteAllBytes($certPath, [Convert]::FromBase64String($env:WINDOWS_CERT_PFX))
+          "WINDOWS_CERT_PATH=$certPath" >> $env:GITHUB_ENV
+          "WINDOWS_CERT_PASSWORD=$env:WINDOWS_CERT_PASSWORD" >> $env:GITHUB_ENV
+
+          $confPath = 'src-tauri/tauri.conf.json'
+          $json = Get-Content $confPath -Raw | ConvertFrom-Json
+          $sign = [pscustomobject]@{
+            cmd  = 'pwsh'
+            args = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'sign-windows.ps1', '%1')
+          }
+          if ($json.bundle.PSObject.Properties['windows']) {
+            $json.bundle.windows | Add-Member -NotePropertyName signCommand -NotePropertyValue $sign -Force
+          } else {
+            $json.bundle | Add-Member -NotePropertyName windows -NotePropertyValue ([pscustomobject]@{ signCommand = $sign })
+          }
+          $json | ConvertTo-Json -Depth 20 | Set-Content $confPath -Encoding utf8
+
+      # 未配置 updater 签名私钥时，移除 pubkey 避免 Tauri 构建报错（用 node 保证跨平台可用）
+      - name: Remove updater pubkey if no signing key
+        if: env.TAURI_SIGNING_PRIVATE_KEY == ''
+        run: node -e "const fs=require('fs');const p='src-tauri/tauri.conf.json';const j=JSON.parse(fs.readFileSync(p,'utf8'));if(j.plugins&&j.plugins.updater&&'pubkey' in j.plugins.updater){delete j.plugins.updater.pubkey;fs.writeFileSync(p,JSON.stringify(j,null,2));console.log('已移除 updater.pubkey');}"
+
+      - name: Build release
+        env:
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: bun run tauri build ${{ matrix.target != '' && format('--target {0}', matrix.target) || '' }}
+
+      # NSIS 产物名含中文（速启_0.9.0_x64-setup.exe），action-gh-release 上传时会剥掉非 ASCII 字符，
+      # 变成 _0.9.0_x64-setup.exe。先重命名为 ASCII，保证资产名与 latest.json 的 url 一致。
+      - name: Rename NSIS installer to ASCII
+        if: matrix.id == 'win'
+        shell: pwsh
+        run: |
+          $ver = "${{ github.ref_name }}" -replace '^v',''
+          Get-ChildItem 'src-tauri/target/release/bundle/nsis/*-setup.exe' | ForEach-Object {
+            if ($_.Name -notlike 'suqi_*') { Rename-Item $_.FullName "suqi_${ver}_x64-setup.exe" }
+          }
+          Get-ChildItem 'src-tauri/target/release/bundle/nsis/*-setup.exe.sig' | ForEach-Object {
+            if ($_.Name -notlike 'suqi_*') { Rename-Item $_.FullName "suqi_${ver}_x64-setup.exe.sig" }
+          }
+
+      # macOS 产物名同样含中文（速启.app / 速启_0.9.0_aarch64.dmg），统一重命名为 ASCII
+      - name: Rename macOS bundles to ASCII
+        if: startsWith(matrix.id, 'mac')
+        shell: bash
+        run: |
+          set -e
+          ver="${GITHUB_REF_NAME}"; plain="${ver#v}"
+          bundle="${{ matrix.bundle }}"
+          arch="${{ matrix.arch }}"
+          for f in "$bundle"/macos/*.app.tar.gz; do
+            [ -e "$f" ] || continue
+            mv "$f" "$bundle/macos/suqi_${plain}_${arch}.app.tar.gz"
+          done
+          for f in "$bundle"/macos/*.app.tar.gz.sig; do
+            [ -e "$f" ] || continue
+            mv "$f" "$bundle/macos/suqi_${plain}_${arch}.app.tar.gz.sig"
+          done
+          for f in "$bundle"/dmg/*.dmg; do
+            [ -e "$f" ] || continue
+            mv "$f" "$bundle/dmg/suqi_${plain}_${arch}.dmg"
+          done
+          ls -R "$bundle"
+
+      # Windows 额外产出单文件绿色版 exe
+      - name: Rename portable exe
+        if: matrix.id == 'win'
+        run: cp src-tauri/target/release/suqi.exe src-tauri/target/release/suqi_${{ github.ref_name }}_x64_portable.exe
+
+      # 各平台分别生成 latest.json 片段（Windows 生成 windows-x86_64，
+      # macOS 按架构生成 darwin-aarch64 / darwin-x86_64），由末尾的 latest job 合并后上传。
+      - name: Generate latest fragment (Windows)
+        if: matrix.id == 'win'
+        shell: pwsh
+        run: |
+          $ver = "${{ github.ref_name }}"
+          $plainVer = $ver -replace '^v',''
+          $sig = (Get-Content "src-tauri/target/release/bundle/nsis/suqi_${plainVer}_x64-setup.exe.sig" -Raw).Trim()
+          $json = @{
+            version   = $ver
+            notes     = "https://github.com/${{ github.repository }}/releases/tag/$ver"
+            pub_date  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            platforms = @{
+              "windows-x86_64" = @{
+                signature = $sig
+                url       = "https://github.com/${{ github.repository }}/releases/download/$ver/suqi_${plainVer}_x64-setup.exe"
+              }
+            }
+          } | ConvertTo-Json -Depth 5
+          $json | Set-Content 'latest-win.json' -Encoding utf8
+
+      - name: Generate latest fragment (macOS)
+        if: startsWith(matrix.id, 'mac')
+        shell: bash
+        run: |
+          set -e
+          ver="${GITHUB_REF_NAME}"; plain="${ver#v}"
+          bundle="${{ matrix.bundle }}"
+          arch="${{ matrix.arch }}"
+          case "$arch" in
+            arm64)  key="darwin-aarch64" ;;
+            x86_64) key="darwin-x86_64" ;;
+            *) echo "未知架构: $arch"; exit 1 ;;
+          esac
+          sig=$(cat "$bundle/macos/suqi_${plain}_${arch}.app.tar.gz.sig")
+          url="https://github.com/${{ github.repository }}/releases/download/$ver/suqi_${plain}_${arch}.app.tar.gz"
+          cat > "latest-${{ matrix.id }}.json" <<EOF
+          {
+            "version": "$ver",
+            "notes": "https://github.com/${{ github.repository }}/releases/tag/$ver",
+            "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "platforms": {
+              "$key": { "signature": "$sig", "url": "$url" }
+            }
+          }
+          EOF
+
+      # Windows 生成 SHA-256 / MD5 校验文件。
+      # 注意：文件名必须保持 sha256sums.txt（应用内便携版/安装版更新会拉取该文件）。
+      - name: Generate checksums (Windows)
+        if: matrix.id == 'win'
+        shell: pwsh
+        run: |
+          $files = @()
+          $files += Get-ChildItem 'src-tauri/target/release/bundle/nsis/suqi_*_x64-setup.exe' -ErrorAction SilentlyContinue
+          $files += Get-ChildItem 'src-tauri/target/release/suqi_*_x64_portable.exe' -ErrorAction SilentlyContinue
+          if ($files.Count -eq 0) { throw '未找到任何发布产物' }
+          $files | ForEach-Object {
+            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
+          } | Set-Content 'sha256sums.txt' -Encoding utf8
+          $files | ForEach-Object {
+            "$((Get-FileHash $_.FullName -Algorithm MD5).Hash.ToLower())  $($_.Name)"
+          } | Set-Content 'md5sums.txt' -Encoding utf8
+          Get-Content 'sha256sums.txt'
+          Get-Content 'md5sums.txt'
+
+      # macOS 校验文件按架构单独命名，避免与 Windows / 另一架构冲突
+      - name: Generate checksums (macOS)
+        if: startsWith(matrix.id, 'mac')
+        shell: bash
+        run: |
+          set -e
+          bundle="${{ matrix.bundle }}"
+          arch="${{ matrix.arch }}"
+          cd "$bundle"
+          : > "$GITHUB_WORKSPACE/sha256sums-macos-${arch}.txt"
+          : > "$GITHUB_WORKSPACE/md5sums-macos-${arch}.txt"
+          found=0
+          for f in dmg/suqi_*_${arch}.dmg macos/suqi_*_${arch}.app.tar.gz; do
+            [ -e "$f" ] || continue
+            found=1
+            (cd "$(dirname "$f")" && shasum -a 256 "$(basename "$f")") >> "$GITHUB_WORKSPACE/sha256sums-macos-${arch}.txt"
+            (cd "$(dirname "$f")" && md5 -r "$(basename "$f")") >> "$GITHUB_WORKSPACE/md5sums-macos-${arch}.txt"
+          done
+          [ "$found" -eq 1 ] || { echo '未找到任何发布产物'; exit 1; }
+          cat "$GITHUB_WORKSPACE/sha256sums-macos-${arch}.txt"
+          cat "$GITHUB_WORKSPACE/md5sums-macos-${arch}.txt"
+
+      - name: Upload latest fragment
+        uses: actions/upload-artifact@v4
+        with:
+          name: latest-${{ matrix.id }}
+          path: latest-*.json
+
+      - name: Create release (Windows)
+        if: matrix.id == 'win'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "suqi ${{ github.ref_name }}"
+          draft: false
+          prerelease: false
+          files: |
+            src-tauri/target/release/bundle/nsis/suqi_*_x64-setup.exe
+            src-tauri/target/release/bundle/nsis/suqi_*_x64-setup.exe.sig
+            src-tauri/target/release/suqi_*_x64_portable.exe
+            sha256sums.txt
+            md5sums.txt
+
+      - name: Create release (macOS)
+        if: startsWith(matrix.id, 'mac')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "suqi ${{ github.ref_name }}"
+          draft: false
+          prerelease: false
+          files: |
+            ${{ matrix.bundle }}/dmg/suqi_*_${{ matrix.arch }}.dmg
+            ${{ matrix.bundle }}/macos/suqi_*_${{ matrix.arch }}.app.tar.gz
+            ${{ matrix.bundle }}/macos/suqi_*_${{ matrix.arch }}.app.tar.gz.sig
+            sha256sums-macos-${{ matrix.arch }}.txt
+            md5sums-macos-${{ matrix.arch }}.txt
+
+  # 合并各平台的 latest.json 片段，生成最终自动更新清单并上传
+  latest:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download fragments
+        uses: actions/download-artifact@v4
+        with:
+          pattern: latest-*
+          merge-multiple: true
+
+      - name: Merge latest.json
+        run: |
+          node -e '
+            const fs = require("fs");
+            const files = fs.readdirSync(".").filter((f) => /^latest-.*\.json$/.test(f));
+            if (files.length === 0) { throw new Error("未找到 latest.json 片段"); }
+            const platforms = {};
+            let base = null;
+            for (const f of files) {
+              const j = JSON.parse(fs.readFileSync(f, "utf8"));
+              if (!base) base = j;
+              Object.assign(platforms, j.platforms || {});
+            }
+            const out = { version: base.version, notes: base.notes, pub_date: base.pub_date, platforms };
+            fs.writeFileSync("latest.json", JSON.stringify(out, null, 2));
+            console.log(JSON.stringify(out, null, 2));
+          '
+
+      - name: Upload latest.json
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: latest.json

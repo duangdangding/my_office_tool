@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "id": "lscopy",
+  "name": "共享剪贴板",
+  "version": "1.10.1",
+  "description": "管理文字、图片和文件剪贴记录，支持跨设备同步、局域网文件互传与安全锁定。",
+  "author": "duangdangding",
+  "category": "剪贴协作",
+  "icon": "clipboard",
+  "permissions": ["clipboard", "network", "fileSystem", "globalShortcut", "autostart"],
+  "entry": {
+    "mode": "auto",
+    "executable": [
+      "src-tauri/target/release/lscopy.exe",
+      "src-tauri/target/debug/lscopy.exe"
+    ],
+    "dev": {
+      "program": "bun",
+      "args": ["run", "tauri", "dev"],
+      "cwd": "."
+    },
+    "build": {
+      "program": "bun",
+      "args": ["run", "tauri", "build"],
+      "cwd": "."
+    }
+  },
+  "standalone": {
+    "instructions": "在此目录执行 bun install，然后执行 bun run tauri dev；发布时使用 bun run tauri build。"
+  }
+}

@@ -1,0 +1,106 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    env:
+      # secrets 不能直接用于 if，先映射到 job 级环境变量。
+      WINDOWS_CERT_PFX: ${{ secrets.WINDOWS_CERT_PFX }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Check release version
+        run: node scripts/check-release.mjs "${{ github.ref_name }}"
+
+      - name: Verify project
+        run: |
+          npm run build
+          cargo test --manifest-path src-tauri/Cargo.toml
+          cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
+
+      # 配置 WINDOWS_CERT_PFX / WINDOWS_CERT_PASSWORD 后自动签名。
+      - name: Prepare Windows code signing
+        if: env.WINDOWS_CERT_PFX != ''
+        shell: pwsh
+        env:
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          $certPath = "$env:RUNNER_TEMP\office-toolbox-cert.pfx"
+          [IO.File]::WriteAllBytes($certPath, [Convert]::FromBase64String($env:WINDOWS_CERT_PFX))
+          "WINDOWS_CERT_PATH=$certPath" >> $env:GITHUB_ENV
+          "WINDOWS_CERT_PASSWORD=$env:WINDOWS_CERT_PASSWORD" >> $env:GITHUB_ENV
+
+          $confPath = 'src-tauri/tauri.conf.json'
+          $json = Get-Content $confPath -Raw | ConvertFrom-Json
+          $sign = [pscustomobject]@{
+            cmd  = 'pwsh'
+            args = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'scripts/sign-windows.ps1', '%1')
+          }
+          if ($json.bundle.PSObject.Properties['windows']) {
+            $json.bundle.windows | Add-Member -NotePropertyName signCommand -NotePropertyValue $sign -Force
+          } else {
+            $json.bundle | Add-Member -NotePropertyName windows -NotePropertyValue ([pscustomobject]@{ signCommand = $sign })
+          }
+          $json | ConvertTo-Json -Depth 20 | Set-Content $confPath -Encoding utf8
+
+      - name: Build release
+        run: npm run tauri build
+
+      # GitHub Release 资产统一使用 ASCII 文件名，避免中文被上传工具移除。
+      - name: Prepare release assets
+        shell: pwsh
+        run: |
+          $ver = "${{ github.ref_name }}" -replace '^v',''
+          Get-ChildItem 'src-tauri/target/release/bundle/nsis/*-setup.exe' | ForEach-Object {
+            Rename-Item $_.FullName "office-toolbox_${ver}_x64-setup.exe"
+          }
+          Copy-Item 'src-tauri/target/release/office-toolbox.exe' "src-tauri/target/release/office-toolbox_${ver}_x64_portable.exe"
+
+      - name: Generate checksums
+        shell: pwsh
+        run: |
+          $files = @()
+          $files += Get-ChildItem 'src-tauri/target/release/bundle/nsis/office-toolbox_*_x64-setup.exe' -ErrorAction Stop
+          $files += Get-ChildItem 'src-tauri/target/release/office-toolbox_*_x64_portable.exe' -ErrorAction Stop
+          $files | ForEach-Object {
+            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
+          } | Set-Content 'sha256sums.txt' -Encoding ascii
+          $files | ForEach-Object {
+            "$((Get-FileHash $_.FullName -Algorithm MD5).Hash.ToLower())  $($_.Name)"
+          } | Set-Content 'md5sums.txt' -Encoding ascii
+          Get-Content 'sha256sums.txt'
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "办公工具箱 ${{ github.ref_name }}"
+          draft: false
+          prerelease: false
+          files: |
+            src-tauri/target/release/bundle/nsis/office-toolbox_*_x64-setup.exe
+            src-tauri/target/release/office-toolbox_*_x64_portable.exe
+            sha256sums.txt
+            md5sums.txt
