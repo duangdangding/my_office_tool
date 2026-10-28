@@ -84,8 +84,8 @@ git push origin main
    ```
 
 4. `v*` 标签触发 `.github/workflows/release.yml`，产出 Windows NSIS 安装包及 `.sig`、便携版 exe、macOS Apple Silicon／Intel DMG 与 `.app.tar.gz` 及 `.sig`，最后合并并上传 `latest.json`，以及分平台 SHA-256／MD5 文件。Release 资产使用 ASCII 文件名，重命名安装包或更新包时必须同步重命名 `.sig`，避免与清单 URL 不一致。
-5. **构建结果由用户自行查看确认**。助手不要通过 GitHub API、gh CLI、轮询或日志下载查询 Actions 状态；推完标签即停下，等用户主动告知结果。
-6. 用户确认成功后，新建 `release-notes-X.Y.Z.md`，更新 Release 说明：
+5. **构建结果由助手主动查看确认**。推送标签后通过 GitHub API 或 gh CLI 查看 Actions 状态；失败时读取失败步骤和日志、直接修复并重新触发构建，不要求用户粘贴日志。轮询间隔保持合理，不要密集请求。
+6. 构建成功后，新建 `release-notes-X.Y.Z.md`，更新 Release 说明：
 
    ```bash
    GITHUB_REPOSITORY=owner/repo GH_TOKEN=... npm run release:notes -- vX.Y.Z release-notes-X.Y.Z.md

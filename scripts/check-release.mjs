@@ -43,5 +43,9 @@ if (tauriConfig.bundle?.createUpdaterArtifacts !== true || !updater?.pubkey || !
 if (updater.endpoints.some((endpoint) => endpoint !== "https://github.com/duangdangding/my_office_tool/releases/latest/download/latest.json")) {
   throw new Error("updater endpoint 必须指向主程序仓库的 latest.json，不能复用其他项目的地址");
 }
+const decodedPubkey = Buffer.from(updater.pubkey, "base64").toString("utf8");
+if (!decodedPubkey.includes("untrusted comment: minisign public key:") || !/\nRW[0-9A-Za-z+/=]+\r?\n?$/.test(decodedPubkey)) {
+  throw new Error("updater pubkey 格式无效：应直接使用 .key.pub 文件内容，不要再次 Base64 编码");
+}
 
 console.log(`发版检查通过：${Object.keys(versions).length} 处版本均为 ${version}，updater 配置完整${tag ? `，标签为 ${tag}` : ""}。`);

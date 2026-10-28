@@ -41,7 +41,7 @@
       "endpoints": [
         "https://github.com/duangdangding/my_office_tool/releases/latest/download/latest.json"
       ],
-      "pubkey": "ZFc1MGNuVnpkR1ZrSUdOdmJXMWxiblE2SUcxcGJtbHphV2R1SUhCMVlteHBZeUJyWlhrNklEazNNMFJDUWpaRlJrRXdRMEkzUVRFS1VsZFRhSFIzZWpaaWNuTTViRGw2TDJaVFRYRk1aakpHTjJWb05HdHhkbTkyU2t4eE1tUjRUbXBPYm5rMVZYVm9SVWh3VUhkMGFtUUs=",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDk3M0RCQjZFRkEwQ0I3QTEKUldTaHR3ejZicnM5bDl6L2ZTTXFMZjJGN2VoNGtxdm92SkxxMmR4TmpObnk1VXVoRUhwUHd0amQK",
       "windows": {
         "installMode": "passive"
       }
