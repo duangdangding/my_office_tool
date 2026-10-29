@@ -1522,6 +1522,7 @@ fn normalize_proxy_url(value: &str) -> Option<String> {
     Some(if value.contains("://") { value.into() } else { format!("http://{value}") })
 }
 
+#[cfg(any(windows, test))]
 fn parse_windows_proxy_server(value: &str) -> Option<String> {
     if !value.contains('=') {
         return normalize_proxy_url(value);
