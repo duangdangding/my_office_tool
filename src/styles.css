@@ -329,6 +329,8 @@ code { font-family: "Cascadia Code", Consolas, monospace; }
 .plugin-title { display: flex; align-items: baseline; gap: 8px; }
 .plugin-title h3 { margin: 0; color: #23332c; font-size: 16px; font-weight: 650; }
 .plugin-title span { color: #a1aba5; font-size: 9px; }
+.plugin-detail-button { display: inline-flex; align-items: center; gap: 3px; margin-left: auto; padding: 3px 0 3px 8px; color: #82908a; background: transparent; border: 0; font-size: 9px; }
+.plugin-detail-button:hover { color: var(--green); }
 .plugin-category { margin-top: 4px; color: #7d9b8c; font-size: 9px; }
 .plugin-description { min-height: 36px; margin: 12px 0 14px; color: #7e8984; font-size: 10px; line-height: 1.75; }
 .runtime-detail { display: flex; align-items: center; gap: 8px; margin: -3px 0 13px; padding: 9px 10px; border-radius: 7px; font-size: 9px; line-height: 1.55; }
@@ -336,10 +338,12 @@ code { font-family: "Cascadia Code", Consolas, monospace; }
 .runtime-detail.starting .spinner { flex: 0 0 auto; color: #b18a48; }
 .runtime-detail.failed { justify-content: space-between; color: #a75550; background: #fcf1f0; border: 1px solid #f1dedd; }
 .runtime-detail.failed button { flex: 0 0 auto; padding: 2px 0; color: #a34844; background: transparent; border: 0; font-size: 9px; text-decoration: underline; }
+.runtime-detail.web { color: #658374; background: #f2f7f4; border: 1px solid #e1ebe5; }
+.runtime-detail.web code { overflow-wrap: anywhere; }
 .capability-row { display: flex; flex-wrap: wrap; gap: 5px; padding-bottom: 15px; }
 .capability-row span { display: inline-flex; align-items: center; gap: 4px; padding: 3px 6px; color: #88948e; background: #f6f8f6; border-radius: 4px; font-size: 8px; }
-.card-footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding-top: 13px; border-top: 1px solid #edf0ee; }
-.card-actions { display: flex; align-items: center; gap: 6px; }
+.card-footer { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; padding-top: 13px; border-top: 1px solid #edf0ee; }
+.card-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 6px; margin-left: auto; }
 .card-actions .button { min-height: 31px; padding: 0 11px; font-size: 10px; }
 .icon-button { width: 31px; height: 31px; display: grid; place-items: center; color: #89958f; background: transparent; border: 1px solid transparent; border-radius: 7px; }
 .icon-button:hover { color: var(--green); background: #f2f7f4; border-color: #e0ebe5; }
@@ -425,6 +429,10 @@ code { font-family: "Cascadia Code", Consolas, monospace; }
 .settings-directory > div { min-width: 0; }
 .settings-directory b { display: block; margin-bottom: 7px; color: #52675b; font-size: 10px; }
 .settings-directory code { display: block; overflow-wrap: anywhere; color: #819188; font-size: 9px; line-height: 1.6; }
+.proxy-form { margin-top: 18px; }
+.proxy-input-row { display: flex; align-items: center; gap: 10px; }
+.proxy-input-row .text-input { min-width: 0; flex: 1; }
+.proxy-input-row .button { flex: 0 0 auto; white-space: nowrap; }
 .management-card { margin-bottom: 20px; }
 .management-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 20px; }
 .management-grid > div { display: grid; grid-template-columns: 24px 1fr; padding: 15px; color: #6b947f; background: #f7faf8; border: 1px solid #e6ede8; border-radius: 10px; }
@@ -452,6 +460,12 @@ code { font-family: "Cascadia Code", Consolas, monospace; }
 .warning-box { display: flex; gap: 10px; padding: 13px; color: #9b784a; background: #faf6ee; border: 1px solid #eee4d2; border-radius: 9px; }
 .warning-box p { margin: 0; color: #988363; font-size: 10px; line-height: 1.7; }
 .import-warning { margin-top: 18px; }
+#import-feedback:not(:empty), #manifest-feedback:not(:empty) { margin-top: 16px; }
+.import-progress { display: flex; align-items: center; gap: 11px; padding: 13px 14px; color: var(--accent-text); background: var(--accent-soft); border: 1px solid var(--line); border-radius: 9px; }
+.import-progress .spinner { flex: 0 0 auto; width: 15px; height: 15px; }
+.import-progress p { margin: 0; font-size: 10px; line-height: 1.7; }
+.import-error { margin: 0; }
+.import-error span { display: block; margin-top: 8px; font-size: 9px; line-height: 1.6; }
 .import-source-tabs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; margin: 18px 0; padding: 4px; background: #f3f6f4; border-radius: 9px; }
 .import-source-tabs button { min-height: 35px; display: flex; align-items: center; justify-content: center; gap: 7px; color: #84928b; background: transparent; border: 0; border-radius: 7px; font-size: 11px; }
 .import-source-tabs button.active { color: var(--green); background: #fff; box-shadow: 0 2px 7px rgba(32,65,48,.08); font-weight: 600; }
@@ -502,6 +516,34 @@ code { font-family: "Cascadia Code", Consolas, monospace; }
 .error-box b { font-size: 11px; }
 .error-box p { margin: 6px 0 0; font: 10px/1.65 "Cascadia Code", Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
 .log-view { min-height: 260px; max-height: 420px; overflow: auto; margin: 0; padding: 15px; color: #bcd1c5; background: #17241f; border-radius: 9px; font: 10px/1.65 "Cascadia Code", Consolas, monospace; white-space: pre-wrap; word-break: break-all; }
+.readme-modal .modal { width: min(780px, 100%); }
+.readme-modal.readme-fullscreen { padding: 0; }
+.readme-modal.readme-fullscreen .modal { width: 100%; height: 100vh; max-width: none; max-height: none; display: flex; flex-direction: column; padding: 28px 36px; border: 0; border-radius: 0; }
+.readme-modal.readme-fullscreen .readme-content { flex: 1; min-height: 0; max-height: none; font-size: 13px; }
+.readme-modal.readme-fullscreen .modal-actions { flex: 0 0 auto; }
+.readme-content { min-height: 220px; max-height: 58vh; overflow: auto; padding: 6px 22px 22px; color: var(--text-soft); background: var(--surface-soft); border: 1px solid var(--line); border-radius: 10px; font-size: 12px; line-height: 1.8; overflow-wrap: anywhere; }
+.readme-content > :first-child { margin-top: 0; }
+.readme-content h1, .readme-content h2, .readme-content h3, .readme-content h4 { margin: 1.45em 0 .65em; color: var(--heading); line-height: 1.4; font-weight: 650; }
+.readme-content h1 { padding-bottom: .45em; border-bottom: 1px solid var(--line); font-size: 24px; }
+.readme-content h2 { padding-bottom: .35em; border-bottom: 1px solid var(--line); font-size: 19px; }
+.readme-content h3 { font-size: 16px; }
+.readme-content h4 { font-size: 13px; }
+.readme-content p, .readme-content ul, .readme-content ol, .readme-content blockquote { margin: 10px 0; }
+.readme-content ul, .readme-content ol { padding-left: 24px; }
+.readme-content li + li { margin-top: 4px; }
+.readme-content a { color: var(--accent-text); text-decoration: none; }
+.readme-content a:hover { text-decoration: underline; }
+.readme-content code { padding: 2px 5px; color: var(--accent-text); background: var(--accent-soft); border-radius: 4px; font: 11px/1.6 "Cascadia Code", Consolas, monospace; }
+.readme-content pre { overflow: auto; margin: 14px 0; padding: 15px 17px; color: #d7e5dc; background: #17241f; border-radius: 8px; }
+.readme-content pre code { padding: 0; color: inherit; background: transparent; font-size: 11px; line-height: 1.7; }
+.readme-content blockquote { padding: 3px 14px; color: var(--muted); border-left: 3px solid var(--accent-border); }
+.readme-content blockquote > :first-child { margin-top: 0; }
+.readme-content blockquote > :last-child { margin-bottom: 0; }
+.readme-content table { width: 100%; margin: 14px 0; border-spacing: 0; border-collapse: collapse; font-size: 11px; }
+.readme-content th, .readme-content td { padding: 8px 11px; border: 1px solid var(--line-strong); text-align: left; }
+.readme-content th { color: var(--heading); background: var(--accent-soft); }
+.readme-content img { max-width: 100%; height: auto; border-radius: 7px; }
+.readme-content hr { margin: 22px 0; border: 0; border-top: 1px solid var(--line); }
 
 #toast-root { position: fixed; z-index: 200; right: 24px; bottom: 24px; display: flex; flex-direction: column; gap: 9px; pointer-events: none; }
 .toast { min-width: 260px; max-width: 440px; display: flex; align-items: flex-start; gap: 10px; padding: 13px 15px; color: #53645b; background: rgba(255,255,255,.97); border: 1px solid #dfe7e2; border-radius: 10px; box-shadow: 0 10px 30px rgba(23,45,33,.12); font-size: 11px; line-height: 1.5; opacity: 0; transform: translateY(8px); transition: .22s; }

@@ -1,4 +1,6 @@
 import "./styles.css";
+import DOMPurify from "dompurify";
+import { marked } from "marked";
 import {
   cancelPluginImport,
   chooseExtractDirectory,
@@ -15,11 +17,14 @@ import {
   launchPlugin,
   listPlugins,
   openPluginDirectory,
+  openPluginPage,
   readPluginLog,
+  readPluginReadme,
   removePlugin,
   saveRules,
   setLaunchAtStartup,
   setPluginDirectory,
+  setProxy,
   setSilentStart,
   setTheme,
   stopPlugin,
@@ -56,6 +61,7 @@ let pendingAppUpdate: Update | null = null;
 let updateDownloaded = 0;
 let updateTotal = 0;
 let pendingImportSession = "";
+let pendingImportDraft: PluginManifest | null = null;
 
 const systemThemeQuery = window.matchMedia("(prefers-color-scheme: dark)");
 const themes: Array<{ id: AppTheme; label: string; description: string; background: string; accent: string; sidebar: string }> = [
@@ -102,6 +108,8 @@ const icons: Record<string, string> = {
   play: '<path d="m8 5 11 7-11 7V5Z"/>',
   stop: '<rect x="6" y="6" width="12" height="12" rx="2"/>',
   external: '<path d="M14 4h6v6M20 4l-9 9"/><path d="M18 13v6a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h6"/>',
+  expand: '<path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5M3 8l6-6M21 8l-6-6M3 16l6 6M21 16l-6 6"/>',
+  minimize: '<path d="M3 8h5V3M21 8h-5V3M3 16h5v5M21 16h-5v5M8 8 2 2M16 8l6-6M8 16l-6 6M16 16l6 6"/>',
   folder: '<path d="M3 7a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/>',
   terminal: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M13 15h4"/>',
   trash: '<path d="M4 7h16M9 7V4h6v3M7 7l1 14h8l1-14M10 11v6M14 11v6"/>',
@@ -166,13 +174,15 @@ function pluginCard(plugin: PluginView): string {
   const busy = busyId === manifest.id;
   const starting = runtime.status === "starting" || (busy && runtime.status === "stopped");
   const status = statusMeta(starting ? "starting" : runtime.status);
+  const web = manifest.entry.web;
+  const openPageButton = web ? `<button class="button launch" data-action="open-page" data-id="${manifest.id}">${icon("external", 15)}打开页面</button>` : "";
   let actionButton: string;
   if (runtime.status === "running") {
-    actionButton = `<button class="button subtle" data-action="stop" data-id="${manifest.id}" ${busy ? "disabled" : ""}>${icon("stop", 15)}停止</button>`;
+    actionButton = `${openPageButton}<button class="button subtle" data-action="stop" data-id="${manifest.id}" ${busy ? "disabled" : ""}>${icon("stop", 15)}停止</button>`;
   } else if (starting) {
     actionButton = `<button class="button subtle" data-action="stop" data-id="${manifest.id}">${icon("stop", 15)}取消启动</button>`;
   } else if (runtime.status === "detached") {
-    actionButton = `<button class="button subtle" data-action="open-dir" data-id="${manifest.id}">${icon("external", 15)}独立运行中</button>`;
+    actionButton = openPageButton || `<button class="button subtle" data-action="open-dir" data-id="${manifest.id}">${icon("external", 15)}独立运行中</button>`;
   } else {
     actionButton = `<button class="button launch" data-action="launch" data-id="${manifest.id}" ${!rules.enabled || busy ? "disabled" : ""}>${icon("play", 15)}${runtime.status === "failed" ? "重试" : "启动"}</button>`;
   }
@@ -181,16 +191,17 @@ function pluginCard(plugin: PluginView): string {
       <div class="plugin-icon ${manifest.icon}">${icon(manifest.icon, 28)}</div>
       <div class="card-badges"><span class="status-badge ${status.className}"><i></i>${status.label}</span><span class="source-badge">${plugin.source === "builtin" ? "内置" : plugin.origin?.type === "git" ? "Git 导入" : plugin.origin?.type === "archive" ? "压缩包导入" : "本地导入"}</span></div>
     </div>
-    <div class="plugin-title"><h3>${escape(manifest.name)}</h3><span>v${escape(manifest.version)}</span></div>
+    <div class="plugin-title"><h3>${escape(manifest.name)}</h3><span>v${escape(manifest.version)}</span><button class="plugin-detail-button" data-action="details" data-id="${manifest.id}">${icon("info", 13)}详情</button></div>
     <div class="plugin-category">${escape(manifest.category || "办公效率")}</div>
     <p class="plugin-description">${escape(manifest.description)}</p>
     ${starting ? `<div class="runtime-detail starting"><span class="spinner"></span><span>${escape(runtime.detail || "正在创建插件进程，请稍候")}</span></div>` : runtime.status === "failed" ? `<div class="runtime-detail failed"><span>${escape(runtime.detail || "插件启动失败")}</span><button data-action="log" data-id="${manifest.id}">详细日志</button></div>` : ""}
+    ${web && ["running", "detached"].includes(runtime.status) ? `<div class="runtime-detail web"><span>页面地址：<code>${escape(web.url)}</code></span></div>` : ""}
     <div class="capability-row"><span>${icon("box", 14)}独立进程</span>${manifest.permissions.slice(0, 2).map((item) => `<span>${escape(permissionLabel(item))}</span>`).join("")}</div>
     <div class="card-footer">
       <label class="mini-switch" title="${rules.enabled ? "停用插件" : "启用插件"}"><input type="checkbox" data-action="toggle" data-id="${manifest.id}" ${rules.enabled ? "checked" : ""} ${busy || starting ? "disabled" : ""}/><span></span><em>${rules.enabled ? "已启用" : "已停用"}</em></label>
       <div class="card-actions">
         ${plugin.source === "imported" ? `<button class="icon-button" data-action="update" data-id="${manifest.id}" title="从来源更新插件" ${busy || runtime.status === "detached" ? "disabled" : ""}>${icon("activity", 17)}</button>` : ""}
-        <button class="icon-button" data-action="extract" data-id="${manifest.id}" title="提取编译产物">${icon("box", 17)}</button>
+        ${manifest.entry.executable.length ? `<button class="icon-button" data-action="extract" data-id="${manifest.id}" title="提取编译产物">${icon("box", 17)}</button>` : ""}
         <button class="icon-button" data-action="rules" data-id="${manifest.id}" title="插件规则">${icon("sliders", 18)}</button>
         <button class="icon-button" data-action="standalone" data-id="${manifest.id}" title="独立启动（不托管）" ${!rules.enabled || busy || runtime.status !== "stopped" ? "disabled" : ""}>${icon("external", 17)}</button>
         ${actionButton}
@@ -233,6 +244,7 @@ function settingsContent(): string {
   return `<section class="page-heading compact"><div><p class="eyebrow">PREFERENCES</p><h1>设置</h1><p>管理工具箱的外观、启动行为和插件存放位置。</p></div></section>
     <section class="spec-card settings-card"><div><span class="section-kicker">APPEARANCE</span><h2>外观主题</h2><p class="settings-description">选择喜欢的配色，切换立即生效，下次启动会继续使用。</p></div><div class="theme-grid">${themes.map((theme) => { const selected = settings?.theme === theme.id; return `<button type="button" class="theme-option ${selected ? "active" : ""}" data-action="theme" data-theme="${theme.id}" aria-pressed="${selected}" ${settingsBusy === "theme" ? "disabled" : ""}><span class="theme-swatch" style="--swatch-bg:${theme.background};--swatch-accent:${theme.accent};--swatch-sidebar:${theme.sidebar}"><i></i><i></i></span><span class="theme-copy"><b>${theme.label}</b><small>${theme.description}</small></span>${selected ? `<span class="theme-check">${icon("check", 15)}</span>` : ""}</button>`; }).join("")}</div></section>
     <section class="spec-card settings-card"><div><span class="section-kicker">STARTUP</span><h2>启动</h2></div><div class="form-section settings-form">${settingToggle("launchAtStartup", "开机启动", "登录系统后自动启动办公工具箱，更改会立即写入系统启动项。", settings.launchAtStartup)}${settingToggle("silentStart", "静默启动", "下次启动时不显示主窗口，只驻留系统托盘；可从托盘菜单打开窗口。", settings.silentStart)}</div></section>
+    <section class="spec-card settings-card"><div><span class="section-kicker">NETWORK</span><h2>网络代理</h2><p class="settings-description">用于 Git 克隆、ZIP 下载和 Node 依赖安装。填写后优先使用配置的代理；留空则检测环境变量和系统代理，连接失败后均会尝试直连。</p></div><form id="proxy-form" class="proxy-form"><label class="field-label" for="proxy-address">代理地址</label><div class="proxy-input-row"><input class="text-input" id="proxy-address" name="proxy" type="text" value="${escape(settings.proxy)}" placeholder="例如：http://127.0.0.1:7890" autocomplete="off" spellcheck="false" ${settingsBusy ? "disabled" : ""}/><button class="button primary" type="submit" ${settingsBusy ? "disabled" : ""}>${settingsBusy === "proxy" ? "正在保存…" : "保存代理"}</button></div><p class="form-hint">可填写 127.0.0.1:7890，未填写协议时按 http:// 处理；清空后保存可恢复本机代理检测。</p></form></section>
     <section class="spec-card settings-card"><div><span class="section-kicker">STORAGE</span><h2>插件目录</h2><p class="settings-description">每次启动都会扫描此目录，新导入的插件也复制到这里。切换目录不会迁移或删除旧文件，规则配置会保留。</p></div><div class="settings-directory"><div><b>${settings.pluginDir.isDefault ? "默认目录" : "自定义目录"}</b><code>${escape(settings.pluginDir.path)}</code></div><button class="button subtle" data-action="plugin-directory">${icon("folder", 16)}更改目录</button></div></section>`;
 }
 
@@ -363,6 +375,7 @@ async function refresh(): Promise<void> {
 function closeModal(): void {
   const sessionId = pendingImportSession;
   pendingImportSession = "";
+  pendingImportDraft = null;
   modalRoot.innerHTML = "";
   if (sessionId) void cancelPluginImport(sessionId).catch((error) => toast(`清理导入临时文件失败：${String(error)}`, "error"));
 }
@@ -374,51 +387,156 @@ function showModal(content: string, className = ""): void {
 function showImport(mode: "local" | "git" | "archive" = "local"): void {
   showModal(`<button class="modal-close" data-action="close-modal" aria-label="关闭">${icon("close")}</button><span class="modal-symbol">${icon("plus", 26)}</span><h2>导入插件</h2><div class="import-source-tabs"><button class="${mode === "local" ? "active" : ""}" data-action="import-mode" data-mode="local">${icon("folder", 16)}本地项目</button><button class="${mode === "archive" ? "active" : ""}" data-action="import-mode" data-mode="archive">${icon("box", 16)}压缩包（免 Git）</button><button class="${mode === "git" ? "active" : ""}" data-action="import-mode" data-mode="git">${icon("terminal", 16)}Git 项目</button></div>
     ${mode === "local" ? `<p class="modal-intro">选择插件文件夹。插件会复制到工具箱，原目录保持不变；没有 <code>office-plugin.json</code> 时，可以扫描并生成。</p><div class="modal-actions"><button class="button subtle" data-action="close-modal">取消</button><button class="button primary" data-action="confirm-import">选择插件文件夹${icon("arrow", 16)}</button></div>` : mode === "archive" ? `<form id="archive-import-form"><p class="modal-intro">输入 ZIP 下载地址或 GitHub 仓库地址，工具箱会直接下载并解压，<b>无需安装 Git</b>。没有清单时可在下载后补全。</p><label class="field-label" for="archive-repository">压缩包或仓库地址</label><input class="text-input" id="archive-repository" name="repository" type="text" placeholder="https://github.com/owner/plugin 或 https://…/plugin.zip" autocomplete="off" required autofocus/><div class="modal-actions"><button type="button" class="button subtle" data-action="close-modal">取消</button><button class="button primary" type="submit">下载并导入${icon("arrow", 16)}</button></div></form>` : `<form id="git-import-form"><p class="modal-intro">输入 Git 仓库地址，工具箱会克隆默认分支及其子模块，本机需已安装 Git。没有清单时可在克隆后补全。</p><label class="field-label" for="git-repository">仓库地址</label><input class="text-input" id="git-repository" name="repository" type="text" placeholder="https://github.com/owner/plugin.git" autocomplete="off" required autofocus/><div class="modal-actions"><button type="button" class="button subtle" data-action="close-modal">取消</button><button class="button primary" type="submit">克隆并导入${icon("arrow", 16)}</button></div></form>`}
-    <div class="warning-box import-warning">${icon("shield", 20)}<p>导入前会检查清单规范、当前平台和启动方式，不兼容的插件不会写入插件目录。插件是可执行代码，请只导入信任的来源。</p></div>`, "import-modal");
+    <div id="import-feedback" aria-live="polite"></div><div class="warning-box import-warning">${icon("shield", 20)}<p>导入前会检查清单规范、当前平台和启动方式，不兼容的插件不会写入插件目录。插件是可执行代码，请只导入信任的来源。</p></div>`, "import-modal");
 }
 
 type ManifestImportRequest = Extract<PluginImportOutcome, { status: "needsManifest" }>;
 
 function showManifestWizard(request: ManifestImportRequest): void {
   const { draft } = request;
+  pendingImportDraft = draft;
   const firstExecutable = draft.entry.executable[0];
   const executablePath = typeof firstExecutable === "string" ? firstExecutable : firstExecutable?.path ?? "";
   const dev = draft.entry.dev;
+  const build = draft.entry.build;
+  const web = draft.entry.web;
+  const webNote = web ? `<div class="form-section manifest-entry-section"><h3>Web 服务 <span>自动适配</span></h3><p class="form-hint">${build ? `启动前自动执行 <code>${escape([build.program, ...build.args].join(" "))}</code>；` : ""}服务就绪后自动打开 <code>${escape(web.url)}</code>。${dev?.env?.PASSWORD ? `本地访问密码：<code>${escape(dev.env.PASSWORD)}</code>。` : ""}</p></div>` : "";
   const candidates = request.executableCandidates.map((path) => `<option value="${escape(path)}"></option>`).join("");
-  showModal(`<button class="modal-close" data-action="close-modal" aria-label="关闭">${icon("close")}</button><span class="modal-symbol">${icon("puzzle", 25)}</span><h2>补全插件清单</h2><p class="modal-intro">没有找到 <code>office-plugin.json</code>。已生成默认配置，请确认启动方式；配置只写入工具箱中的导入副本。</p><div class="standalone-info import-source-info"><b>插件来源 · ${escape(request.platform)}/${escape(request.architecture)}</b><code>${escape(request.source)}</code></div><form id="manifest-import-form" data-session="${escape(request.sessionId)}" data-platform="${request.platform}" data-architecture="${request.architecture}">
+  showModal(`<button class="modal-close" data-action="close-modal" aria-label="关闭">${icon("close")}</button><span class="modal-symbol">${icon("puzzle", 25)}</span><h2>补全插件清单</h2><p class="modal-intro">没有找到 <code>office-plugin.json</code>。已生成默认配置，请确认启动方式；配置只写入工具箱中的导入副本。</p><div class="standalone-info import-source-info"><b>临时下载目录 · ${escape(request.platform)}/${escape(request.architecture)}</b><p>确认后复制到「设置」中定义的插件目录。</p><code>${escape(request.source)}</code></div><form id="manifest-import-form" data-session="${escape(request.sessionId)}" data-platform="${request.platform}" data-architecture="${request.architecture}">
     <div class="manifest-form-grid"><label><span class="field-label">插件名称</span><input class="text-input" name="name" value="${escape(draft.name)}" required/></label><label><span class="field-label">插件 ID</span><input class="text-input" name="id" value="${escape(draft.id)}" pattern="[a-z0-9_-]+" maxlength="64" required/></label><label><span class="field-label">版本</span><input class="text-input" name="version" value="${escape(draft.version)}" required/></label><label><span class="field-label">启动模式</span><select class="text-input" name="mode"><option value="auto" ${draft.entry.mode === "auto" ? "selected" : ""}>自动：程序优先，开发命令回退</option><option value="executable" ${draft.entry.mode === "executable" ? "selected" : ""}>已编译程序</option><option value="dev" ${draft.entry.mode === "dev" ? "selected" : ""}>开发命令</option></select></label></div>
     <label class="manifest-description"><span class="field-label">描述</span><input class="text-input" name="description" value="${escape(draft.description)}"/></label>
     <div class="form-section manifest-entry-section"><h3>已编译程序 <span>相对插件目录</span></h3><input class="text-input" name="executable" value="${escape(executablePath)}" list="executable-candidates" placeholder="例如 target/release/tool.exe"/><datalist id="executable-candidates">${candidates}</datalist><p class="form-hint">${request.executableCandidates.length ? `扫描到 ${request.executableCandidates.length} 个候选程序，可从下拉建议中选择或手动修改。` : "未扫描到当前平台的可执行程序，请手动填写路径或改用开发命令。"}</p></div>
     <div class="form-section manifest-entry-section"><h3>开发命令 <span>自动模式可选</span></h3><div class="manifest-form-grid dev-command-grid"><label><span class="field-label">程序</span><input class="text-input" name="devProgram" value="${escape(dev?.program ?? "")}" placeholder="npm、cargo、python"/></label><label><span class="field-label">工作目录</span><input class="text-input" name="devCwd" value="${escape(dev?.cwd ?? ".")}" required/></label></div><label class="manifest-description"><span class="field-label">参数</span><input class="text-input" name="devArgs" value="${escape(dev?.args.join(" ") ?? "")}" placeholder="run dev"/></label></div>
-    <div class="modal-actions"><button type="button" class="button subtle" data-action="close-modal">取消</button><button class="button primary" type="submit">生成清单并导入${icon("arrow", 16)}</button></div>
+    ${webNote}<div id="manifest-feedback" aria-live="polite"></div><div class="modal-actions"><button type="button" class="button subtle" data-action="close-modal">取消</button><button class="button primary" type="submit" data-action="complete-manifest-import">生成清单并导入${icon("arrow", 16)}</button></div>
   </form>`, "rules-modal");
 }
 
+function showImportFeedback(kind: "busy" | "error", message: string): void {
+  const feedback = modalRoot.querySelector<HTMLElement>("#import-feedback");
+  if (!feedback) return;
+  feedback.innerHTML = kind === "busy"
+    ? `<div class="import-progress" role="status"><span class="spinner dark"></span><p>${escape(message)}</p></div>`
+    : `<div class="error-box import-error" role="alert"><b>导入失败</b><p>${escape(message)}</p><span>请检查网络、仓库地址或项目配置后重试。</span></div>`;
+  modalRoot.querySelectorAll<HTMLButtonElement | HTMLInputElement>(".import-modal button, .import-modal input").forEach((control) => {
+    control.disabled = kind === "busy";
+  });
+}
+
+function showManifestImportFeedback(form: HTMLFormElement, kind: "busy" | "error", message: string): void {
+  const feedback = form.querySelector<HTMLElement>("#manifest-feedback");
+  if (!feedback) return;
+  feedback.innerHTML = kind === "busy"
+    ? `<div class="import-progress" role="status"><span class="spinner dark"></span><p>${escape(message)}</p></div>`
+    : `<div class="error-box import-error" role="alert"><b>导入失败</b><p>${escape(message)}</p><span>请修正配置后重试，或取消后重新导入。</span></div>`;
+  form.querySelectorAll<HTMLButtonElement | HTMLInputElement | HTMLSelectElement>("button, input, select").forEach((control) => {
+    control.disabled = kind === "busy";
+  });
+}
+
+async function submitManifestImport(form: HTMLFormElement): Promise<void> {
+  if (form.dataset.busy === "true") return;
+  const submit = form.querySelector<HTMLButtonElement>('[data-action="complete-manifest-import"]');
+  form.dataset.busy = "true";
+  showManifestImportFeedback(form, "busy", "正在复制插件并生成清单，请耐心等待…");
+  if (submit) submit.textContent = "正在生成并导入…";
+  try {
+    const field = (name: string) => form.querySelector<HTMLInputElement | HTMLSelectElement>(`[name="${name}"]`)?.value.trim() ?? "";
+    const sessionId = form.dataset.session ?? "";
+    const platform = form.dataset.platform === "macos" ? "macos" : "windows";
+    const architecture = form.dataset.architecture === "aarch64" ? "aarch64" : "x86_64";
+    const mode = field("mode") as PluginManifest["entry"]["mode"];
+    const executablePath = field("executable");
+    const devProgram = field("devProgram");
+    if (mode !== "dev" && !executablePath) throw new Error("请填写已编译程序路径，或改用开发命令模式。");
+    if (mode !== "executable" && !devProgram) throw new Error("请填写开发启动程序。");
+    const devArgs = (field("devArgs").match(/"[^"]*"|'[^']*'|\S+/g) ?? []).map((argument) => argument.replace(/^["']|["']$/g, ""));
+    const manifest: PluginManifest = {
+      schemaVersion: 1,
+      id: field("id"),
+      name: field("name"),
+      version: field("version"),
+      description: field("description"),
+      author: "",
+      category: "办公效率",
+      icon: "puzzle",
+      permissions: [],
+      platforms: [platform],
+      entry: {
+        mode,
+        executable: executablePath ? [{ path: executablePath, platforms: [platform], architectures: [architecture] }] : [],
+        dev: devProgram ? { program: devProgram, args: devArgs, cwd: field("devCwd") || ".", env: pendingImportDraft?.entry.dev?.env } : undefined,
+        build: pendingImportDraft?.entry.build,
+        web: pendingImportDraft?.entry.web,
+      },
+      standalone: { instructions: "由办公工具箱按照生成的 office-plugin.json 启动。" },
+    };
+    const plugin = await completePluginImport(sessionId, manifest);
+    pendingImportSession = "";
+    closeModal();
+    await refresh();
+    toast(`已生成清单并导入「${plugin.manifest.name}」。`, "success");
+  } catch (error) {
+    const message = String(error);
+    if (form.isConnected) {
+      showManifestImportFeedback(form, "error", message);
+      if (submit) submit.textContent = "生成清单并导入";
+    }
+    toast(message, "error");
+  } finally {
+    form.dataset.busy = "false";
+  }
+}
+
 async function performImport(importAction: () => Promise<PluginImportOutcome>): Promise<void> {
-  closeModal();
-  loading = true;
-  render();
+  const busyMessage = modalRoot.querySelector("#git-import-form")
+    ? "正在克隆仓库并检查插件，请耐心等待…"
+    : modalRoot.querySelector("#archive-import-form")
+      ? "正在下载、解压并检查插件，请耐心等待…"
+      : "正在检查项目并准备导入…";
+  showImportFeedback("busy", busyMessage);
   try {
     const outcome = await importAction();
     if (outcome.status === "needsManifest") {
-      loading = false;
-      render();
       pendingImportSession = outcome.sessionId;
       showManifestWizard(outcome);
       return;
     }
+    closeModal();
     await refresh();
     toast(`已导入「${outcome.plugin.manifest.name}」。`, "success");
   } catch (error) {
-    loading = false;
-    render();
-    toast(String(error), "error");
+    showImportFeedback("error", String(error));
+  }
+}
+
+async function showDetails(id: string): Promise<void> {
+  const plugin = plugins.find((item) => item.manifest.id === id);
+  if (!plugin) return;
+  showModal(`<button class="modal-close" data-action="close-modal" aria-label="关闭">${icon("close")}</button><span class="modal-symbol">${icon("info", 25)}</span><h2>${escape(plugin.manifest.name)}</h2><p class="modal-intro">插件目录中的 README.md</p><article class="readme-content">正在读取 README.md…</article><div class="modal-actions"><button class="button subtle" data-action="toggle-readme-fullscreen">${icon("expand", 15)}全屏阅读</button><button class="button subtle" data-action="open-dir" data-id="${id}">${icon("folder", 15)}打开插件目录</button><button class="button primary" data-action="close-modal">完成</button></div>`, "readme-modal");
+  const view = modalRoot.querySelector<HTMLElement>(".readme-content");
+  try {
+    const readme = await readPluginReadme(id);
+    if (view) {
+      view.innerHTML = DOMPurify.sanitize(await marked.parse(readme, { gfm: true }));
+      view.querySelectorAll<HTMLAnchorElement>("a").forEach((link) => {
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+      });
+    }
+  } catch (error) {
+    const message = String(error);
+    if (view?.isConnected) closeModal();
+    toast(message, message.includes("没有 README.md") ? "info" : "error");
   }
 }
 
 function showExtract(id: string): void {
   const plugin = plugins.find((item) => item.manifest.id === id);
   if (!plugin) return;
+  if (!plugin.manifest.entry.executable.length) {
+    toast("此插件没有声明编译产物，不支持提取。", "info");
+    return;
+  }
   showModal(`<button class="modal-close" data-action="close-modal">${icon("close")}</button><span class="modal-symbol">${icon("box", 25)}</span><h2>提取「${escape(plugin.manifest.name)}」编译产物</h2><p class="modal-intro">将清单 <code>entry.executable</code> 中已存在的程序复制到所选目录，并保留相对路径。此操作只提取，不会执行编译。</p><div class="artifact-list">${plugin.manifest.entry.executable.map((file) => `<code>${escape(typeof file === "string" ? file : file.path)}</code>`).join("")}</div><div class="modal-actions"><button class="button subtle" data-action="close-modal">取消</button><button class="button primary" data-action="confirm-extract" data-id="${id}">选择目录并提取${icon("arrow", 16)}</button></div>`);
 }
 
@@ -452,7 +570,7 @@ function showRules(id: string): void {
     <div class="form-section"><h3>运行方式</h3>${ruleToggle("enabled", "启用插件", "停用后不能从工具箱启动，托管进程会停止。", rules.enabled)}${ruleToggle("autoStart", "随工具箱启动", "办公工具箱启动后自动拉起此插件。", rules.autoStart)}${ruleToggle("detach", "始终以独立模式启动", "启动后不由工具箱托管；插件退出本体后仍可继续运行。", rules.detach)}</div>
     <div class="form-section"><h3>插件能力 <span>需插件适配</span></h3>${ruleToggle("allowNetwork", "允许网络能力", "向插件声明允许使用网络与设备同步。", rules.allowNetwork)}${ruleToggle("allowClipboard", "允许剪贴板能力", "向插件声明允许读取或写入系统剪贴板。", rules.allowClipboard)}${ruleToggle("allowFileSystem", "允许文件系统能力", "向插件声明允许访问其功能所需文件。", rules.allowFileSystem)}${ruleToggle("allowGlobalShortcut", "允许全局快捷键", "向插件声明允许注册系统级快捷键。", rules.allowGlobalShortcut)}${ruleToggle("allowPluginAutostart", "允许插件设置开机启动", "默认禁止插件绕过工具箱自行设置系统自启。", rules.allowPluginAutostart)}</div>
     <div class="standalone-info"><b>${icon("external", 16)}独立运行</b><p>${escape(manifest.standalone.instructions)}</p><code>${escape(plugin.root)}</code></div>
-    <div class="modal-actions split"><div>${plugin.source === "imported" ? `<button type="button" class="button text-button" data-action="update" data-id="${manifest.id}">${icon("activity", 16)}更新插件</button><button type="button" class="button danger-text" data-action="remove" data-id="${manifest.id}">${icon("trash", 16)}移除插件</button>` : ""}<button type="button" class="button text-button" data-action="extract" data-id="${manifest.id}">${icon("box", 16)}提取产物</button><button type="button" class="button text-button" data-action="log" data-id="${manifest.id}">${icon("terminal", 16)}运行日志</button></div><div><button type="button" class="button subtle" data-action="close-modal">取消</button><button class="button primary" type="submit">保存规则</button></div></div>
+    <div class="modal-actions split"><div>${plugin.source === "imported" ? `<button type="button" class="button text-button" data-action="update" data-id="${manifest.id}">${icon("activity", 16)}更新插件</button><button type="button" class="button danger-text" data-action="remove" data-id="${manifest.id}">${icon("trash", 16)}移除插件</button>` : ""}${manifest.entry.executable.length ? `<button type="button" class="button text-button" data-action="extract" data-id="${manifest.id}">${icon("box", 16)}提取产物</button>` : ""}<button type="button" class="button text-button" data-action="log" data-id="${manifest.id}">${icon("terminal", 16)}运行日志</button></div><div><button type="button" class="button subtle" data-action="close-modal">取消</button><button class="button primary" type="submit">保存规则</button></div></div>
   </form>`, "rules-modal");
 }
 
@@ -524,6 +642,12 @@ document.addEventListener("click", (event) => {
   if (!target) return;
   const action = target.dataset.action!;
   const id = target.dataset.id ?? "";
+  if (action === "complete-manifest-import") {
+    event.preventDefault();
+    const form = target.closest<HTMLFormElement>("form");
+    if (form?.reportValidity()) void submitManifestImport(form);
+    return;
+  }
   if (action === "nav") {
     currentView = (target.dataset.view ?? "all") as ViewKey;
     render();
@@ -574,9 +698,16 @@ document.addEventListener("click", (event) => {
     })();
   }
   else if (action === "rules") showRules(id);
+  else if (action === "details") void showDetails(id);
+  else if (action === "toggle-readme-fullscreen") {
+    const fullscreen = target.closest(".readme-modal")?.classList.toggle("readme-fullscreen") ?? false;
+    target.innerHTML = `${icon(fullscreen ? "minimize" : "expand", 15)}${fullscreen ? "退出全屏" : "全屏阅读"}`;
+    target.setAttribute("aria-pressed", String(fullscreen));
+  }
   else if (action === "update") showUpdate(id);
   else if (action === "extract") showExtract(id);
   else if (action === "log") void showLog(id);
+  else if (action === "open-page") void openPluginPage(id).catch((error) => toast(String(error), "error"));
   else if (action === "open-dir") {
     void openPluginDirectory(id).then(() => { if (!isDesktop) toast("预览模式：插件目录已复制到剪贴板。", "success"); }).catch((error) => toast(String(error), "error"));
   }
@@ -668,6 +799,25 @@ document.addEventListener("change", (event) => {
 
 document.addEventListener("submit", (event) => {
   const form = event.target as HTMLFormElement;
+  if (form.id === "proxy-form") {
+    event.preventDefault();
+    if (settingsBusy) return;
+    const value = form.querySelector<HTMLInputElement>('[name="proxy"]')?.value ?? "";
+    settingsBusy = "proxy";
+    render();
+    void (async () => {
+      try {
+        settings = await setProxy(value);
+        toast(value.trim() ? "代理设置已保存，将在后续网络请求中生效。" : "已清空自定义代理，将自动检测本机代理。", "success");
+      } catch (error) {
+        toast(String(error), "error");
+      } finally {
+        settingsBusy = "";
+        render();
+      }
+    })();
+    return;
+  }
   if (form.id === "git-import-form") {
     event.preventDefault();
     const url = form.querySelector<HTMLInputElement>('[name="repository"]')?.value.trim() ?? "";
@@ -690,60 +840,7 @@ document.addEventListener("submit", (event) => {
   }
   if (form.id === "manifest-import-form") {
     event.preventDefault();
-    const field = (name: string) => form.querySelector<HTMLInputElement | HTMLSelectElement>(`[name="${name}"]`)?.value.trim() ?? "";
-    const sessionId = form.dataset.session ?? "";
-    const platform = form.dataset.platform === "macos" ? "macos" : "windows";
-    const architecture = form.dataset.architecture === "aarch64" ? "aarch64" : "x86_64";
-    const mode = field("mode") as PluginManifest["entry"]["mode"];
-    const executablePath = field("executable");
-    const devProgram = field("devProgram");
-    if (mode !== "dev" && !executablePath) {
-      toast("请填写已编译程序路径，或改用开发命令模式。", "error");
-      return;
-    }
-    if (mode !== "executable" && !devProgram) {
-      toast("请填写开发启动程序。", "error");
-      return;
-    }
-    const devArgs = (field("devArgs").match(/"[^"]*"|'[^']*'|\S+/g) ?? []).map((argument) => argument.replace(/^["']|["']$/g, ""));
-    const manifest: PluginManifest = {
-      schemaVersion: 1,
-      id: field("id"),
-      name: field("name"),
-      version: field("version"),
-      description: field("description"),
-      author: "",
-      category: "办公效率",
-      icon: "puzzle",
-      permissions: [],
-      platforms: [platform],
-      entry: {
-        mode,
-        executable: executablePath ? [{ path: executablePath, platforms: [platform], architectures: [architecture] }] : [],
-        dev: devProgram ? { program: devProgram, args: devArgs, cwd: field("devCwd") || "." } : undefined,
-      },
-      standalone: { instructions: "由办公工具箱按照生成的 office-plugin.json 启动。" },
-    };
-    const submit = form.querySelector<HTMLButtonElement>('button[type="submit"]');
-    if (submit) {
-      submit.disabled = true;
-      submit.textContent = "正在生成并导入…";
-    }
-    void (async () => {
-      try {
-        const plugin = await completePluginImport(sessionId, manifest);
-        pendingImportSession = "";
-        closeModal();
-        await refresh();
-        toast(`已生成清单并导入「${plugin.manifest.name}」。`, "success");
-      } catch (error) {
-        toast(String(error), "error");
-        if (submit) {
-          submit.disabled = false;
-          submit.textContent = "生成清单并导入";
-        }
-      }
-    })();
+    void submitManifestImport(form);
     return;
   }
   if (form.id !== "rules-form") return;
@@ -777,7 +874,11 @@ document.addEventListener("keydown", (event) => {
     searchInput.focus();
     searchInput.select();
   }
-  if (event.key === "Escape" && modalRoot.innerHTML) closeModal();
+  if (event.key === "Escape" && modalRoot.innerHTML) {
+    const fullscreenButton = modalRoot.querySelector<HTMLButtonElement>('.readme-fullscreen [data-action="toggle-readme-fullscreen"]');
+    if (fullscreenButton) fullscreenButton.click();
+    else closeModal();
+  }
 });
 
 void refresh();

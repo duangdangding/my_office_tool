@@ -32,7 +32,9 @@ export interface PluginManifest {
   entry: {
     mode: "auto" | "executable" | "dev";
     executable: PluginExecutable[];
-    dev?: { program: string; args: string[]; cwd: string };
+    dev?: { program: string; args: string[]; cwd: string; env?: Record<string, string> };
+    build?: { program: string; args: string[]; cwd: string; env?: Record<string, string> };
+    web?: { url: string };
   };
   standalone: { instructions: string };
 }
@@ -55,6 +57,7 @@ export interface AppSettings {
   silentStart: boolean;
   theme: AppTheme;
   pluginDir: PluginDirectoryView;
+  proxy: string;
 }
 
 export interface PluginView {

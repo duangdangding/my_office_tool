@@ -42,6 +42,7 @@ const browserSettings: AppSettings = {
   silentStart: false,
   theme: "light",
   pluginDir: { path: "F:\\workspace\\my\\vscode\\my_office_tool\\plugins", isDefault: false },
+  proxy: "",
 };
 
 export async function getSettings(): Promise<AppSettings> {
@@ -63,6 +64,12 @@ export async function setSilentStart(enabled: boolean): Promise<AppSettings> {
 export async function setTheme(theme: AppTheme): Promise<AppSettings> {
   if (isDesktop) return invoke<AppSettings>("set_theme", { theme });
   browserSettings.theme = theme;
+  return clone(browserSettings);
+}
+
+export async function setProxy(value: string): Promise<AppSettings> {
+  if (isDesktop) return invoke<AppSettings>("set_proxy", { value });
+  browserSettings.proxy = value.trim();
   return clone(browserSettings);
 }
 
@@ -166,4 +173,19 @@ export async function openPluginDirectory(id: string): Promise<void> {
 export async function readPluginLog(id: string): Promise<string> {
   if (isDesktop) return invoke<string>("read_plugin_log", { id });
   return `[预览模式] ${id} 的运行日志将在桌面应用中显示。\n插件以独立进程运行，标准输出与错误输出会保存在本机。`;
+}
+
+export async function readPluginReadme(id: string): Promise<string> {
+  if (isDesktop) return invoke<string>("read_plugin_readme", { id });
+  const plugin = mockPlugins.find((item) => item.manifest.id === id);
+  if (!plugin) throw new Error("插件不存在。");
+  return `# ${plugin.manifest.name}\n\n${plugin.manifest.description}\n\n预览模式仅展示插件摘要，桌面应用会读取插件目录中的 README.md。`;
+}
+
+export async function openPluginPage(id: string): Promise<void> {
+  if (isDesktop) return invoke("open_plugin_page", { id });
+  const plugin = mockPlugins.find((item) => item.manifest.id === id);
+  const url = plugin?.manifest.entry.web?.url;
+  if (!url) throw new Error("此插件没有配置 Web 页面地址。");
+  window.open(url, "_blank", "noopener,noreferrer");
 }

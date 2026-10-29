@@ -25,6 +25,14 @@ struct PluginCommand {
     args: Vec<String>,
     #[serde(default = "current_dir")]
     cwd: String,
+    #[serde(default)]
+    env: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginWeb {
+    url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,8 +98,9 @@ struct PluginEntry {
     #[serde(default)]
     executable: Vec<PluginExecutable>,
     dev: Option<PluginCommand>,
-    #[allow(dead_code)]
     build: Option<PluginCommand>,
+    #[serde(default)]
+    web: Option<PluginWeb>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,7 +209,7 @@ struct PluginView {
 }
 
 #[derive(Debug, Clone, Serialize)]
-#[serde(tag = "status", rename_all = "camelCase")]
+#[serde(tag = "status", rename_all = "camelCase", rename_all_fields = "camelCase")]
 enum PluginImportOutcome {
     #[serde(rename = "imported")]
     Imported { plugin: PluginView },
@@ -258,6 +267,8 @@ struct StoredSettings {
     silent_start: bool,
     #[serde(default)]
     theme: AppTheme,
+    #[serde(default)]
+    proxy: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -267,6 +278,7 @@ struct AppSettingsView {
     silent_start: bool,
     theme: AppTheme,
     plugin_dir: PluginDirectoryView,
+    proxy: String,
 }
 
 struct AppState {
@@ -427,6 +439,11 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<(), String> {
         }
         safe_join(Path::new(""), &command.cwd)?;
     }
+    if let Some(web) = &manifest.entry.web {
+        if !(web.url.starts_with("http://") || web.url.starts_with("https://")) || web.url.chars().any(char::is_whitespace) {
+            return Err("Web 服务地址必须是不含空白字符的 http:// 或 https:// 地址".into());
+        }
+    }
     Ok(())
 }
 
@@ -559,36 +576,76 @@ fn executable_candidates(root: &Path) -> Vec<String> {
     candidates
 }
 
+fn package_json(root: &Path) -> Option<serde_json::Value> {
+    fs::read_to_string(root.join("package.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+}
+
+fn node_program(root: &Path) -> &'static str {
+    if root.join("bun.lock").is_file() || root.join("bun.lockb").is_file() { "bun" } else { "npm" }
+}
+
+fn suggested_build_command(root: &Path) -> Option<PluginCommand> {
+    package_json(root)?;
+    let program = node_program(root);
+    let args = if program == "npm" {
+        vec!["install".into(), "--no-audit".into(), "--no-fund".into()]
+    } else {
+        vec!["install".into()]
+    };
+    Some(PluginCommand { program: program.into(), args, cwd: current_dir(), env: HashMap::new() })
+}
+
 fn suggested_dev_command(root: &Path) -> Option<PluginCommand> {
-    let package = root.join("package.json");
-    if package.is_file() {
-        let scripts = fs::read_to_string(package)
-            .ok()
-            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-            .and_then(|value| value.get("scripts").cloned());
-        if let Some(scripts) = scripts {
+    if let Some(package) = package_json(root) {
+        if let Some(scripts) = package.get("scripts") {
             for name in ["dev", "start"] {
                 if scripts.get(name).and_then(serde_json::Value::as_str).is_some() {
-                    let program = if root.join("bun.lock").is_file() || root.join("bun.lockb").is_file() { "bun" } else { "npm" };
-                    return Some(PluginCommand { program: program.into(), args: vec!["run".into(), name.into()], cwd: current_dir() });
+                    let program = node_program(root);
+                    return Some(PluginCommand { program: program.into(), args: vec!["run".into(), name.into()], cwd: current_dir(), env: HashMap::new() });
                 }
             }
         }
     }
     if root.join("Cargo.toml").is_file() {
-        return Some(PluginCommand { program: "cargo".into(), args: vec!["run".into()], cwd: current_dir() });
+        return Some(PluginCommand { program: "cargo".into(), args: vec!["run".into()], cwd: current_dir(), env: HashMap::new() });
     }
     for name in ["main.py", "app.py"] {
         if root.join(name).is_file() {
-            return Some(PluginCommand { program: "python".into(), args: vec![name.into()], cwd: current_dir() });
+            return Some(PluginCommand { program: "python".into(), args: vec![name.into()], cwd: current_dir(), env: HashMap::new() });
         }
     }
     None
 }
 
+fn suggested_web(root: &Path, command: &mut PluginCommand) -> Option<PluginWeb> {
+    let package = package_json(root)?;
+    let script = package.get("scripts")?.get("dev")?.as_str()?;
+    if !script.split_whitespace().any(|part| part == "next") {
+        return None;
+    }
+    let args = script.split_whitespace().collect::<Vec<_>>();
+    let port = args.iter().enumerate().find_map(|(index, argument)| {
+        if matches!(*argument, "-p" | "--port") {
+            args.get(index + 1).and_then(|value| value.parse::<u16>().ok())
+        } else {
+            argument.strip_prefix("--port=").and_then(|value| value.parse::<u16>().ok())
+        }
+    }).unwrap_or(3000);
+    command.env.insert("HOSTNAME".into(), "127.0.0.1".into());
+    command.env.insert("NEXT_TELEMETRY_DISABLED".into(), "1".into());
+    if package.get("name").and_then(serde_json::Value::as_str) == Some("libretv") {
+        command.env.insert("PASSWORD".into(), "libretv".into());
+    }
+    Some(PluginWeb { url: format!("http://127.0.0.1:{port}") })
+}
+
 fn manifest_draft(root: &Path, id: String) -> (PluginManifest, Vec<String>) {
     let candidates = executable_candidates(root);
-    let dev = suggested_dev_command(root);
+    let build = suggested_build_command(root);
+    let mut dev = suggested_dev_command(root);
+    let web = dev.as_mut().and_then(|command| suggested_web(root, command));
     let mode = if candidates.is_empty() {
         "dev"
     } else if dev.is_some() {
@@ -615,7 +672,7 @@ fn manifest_draft(root: &Path, id: String) -> (PluginManifest, Vec<String>) {
         icon: default_icon(),
         permissions: Vec::new(),
         platforms: vec![current_platform().into()],
-        entry: PluginEntry { mode: mode.into(), executable, dev, build: None },
+        entry: PluginEntry { mode: mode.into(), executable, dev, build, web },
         standalone: StandaloneInfo { instructions: "由办公工具箱按照生成的 office-plugin.json 启动。".into() },
     };
     (manifest, candidates)
@@ -768,17 +825,24 @@ fn hide_console(command: &mut Command) {
 #[cfg(not(windows))]
 fn hide_console(_command: &mut Command) {}
 
-fn resolve_program(program: &str) -> String {
+fn resolve_command(program: &str, args: &[String]) -> (String, Vec<String>) {
     #[cfg(windows)]
-    if program.eq_ignore_ascii_case("bun") {
-        if let Some(home) = dirs::home_dir() {
-            let bun = home.join(".bun").join("bin").join("bun.exe");
-            if bun.is_file() {
-                return bun.to_string_lossy().to_string();
+    {
+        if matches!(program.to_ascii_lowercase().as_str(), "npm" | "npx") {
+            let mut resolved_args = vec!["/D".into(), "/S".into(), "/C".into(), program.into()];
+            resolved_args.extend_from_slice(args);
+            return ("cmd.exe".into(), resolved_args);
+        }
+        if program.eq_ignore_ascii_case("bun") {
+            if let Some(home) = dirs::home_dir() {
+                let bun = home.join(".bun").join("bin").join("bun.exe");
+                if bun.is_file() {
+                    return (bun.to_string_lossy().to_string(), args.to_vec());
+                }
             }
         }
     }
-    program.into()
+    (program.into(), args.to_vec())
 }
 
 fn prepare_launch(plugin: &PluginView) -> Result<(String, Vec<String>, PathBuf, bool), String> {
@@ -800,7 +864,8 @@ fn prepare_launch(plugin: &PluginView) -> Result<(String, Vec<String>, PathBuf, 
             if !cwd.is_dir() {
                 return Err(format!("插件工作目录不存在：{}", cwd.display()));
             }
-            return Ok((resolve_program(&command.program), command.args.clone(), cwd, true));
+            let (program, args) = resolve_command(&command.program, &command.args);
+            return Ok((program, args, cwd, true));
         }
     }
     Err(format!(
@@ -831,6 +896,136 @@ fn plugin_is_ready(path: &Path, id: &str) -> bool {
     output_is_ready(&read_log(path), id)
 }
 
+enum BuildAttemptError {
+    Retryable(String),
+    Fatal(String),
+}
+
+fn run_build_command_once(
+    state: &AppState,
+    id: &str,
+    plugin: &PluginView,
+    log: &fs::File,
+    log_path: &Path,
+    proxy: Option<&str>,
+) -> Result<(), BuildAttemptError> {
+    let Some(build) = &plugin.manifest.entry.build else { return Ok(()) };
+    use std::io::Write;
+
+    let root = PathBuf::from(&plugin.root);
+    let cwd = safe_join(&root, &build.cwd).map_err(BuildAttemptError::Fatal)?;
+    if !cwd.is_dir() {
+        return Err(BuildAttemptError::Fatal(format!("构建工作目录不存在：{}", cwd.display())));
+    }
+    let (program, args) = resolve_command(&build.program, &build.args);
+    let mut log = log.try_clone().map_err(|e| BuildAttemptError::Fatal(format!("写入构建日志失败：{e}")))?;
+    let route = if proxy.is_some() { "代理" } else { "直连" };
+    writeln!(log, "[办公工具箱] 正在通过{route}准备依赖：{program} {}", args.join(" ")).map_err(|e| BuildAttemptError::Fatal(format!("写入构建日志失败：{e}")))?;
+    let error_log = log.try_clone().map_err(|e| BuildAttemptError::Fatal(format!("写入构建日志失败：{e}")))?;
+    let mut command = Command::new(&program);
+    command
+        .args(&args)
+        .current_dir(&cwd)
+        .envs(&build.env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(error_log));
+    apply_command_proxy(&mut command, proxy);
+    hide_console(&mut command);
+    let child = command.spawn().map_err(|error| BuildAttemptError::Retryable(format!("无法执行依赖准备命令（{program}）：{error}")))?;
+    let pid = child.id();
+    state.running.lock().unwrap().insert(id.into(), child);
+    set_runtime(state, id, PluginRuntime::new("starting", Some(pid), "正在安装或检查插件依赖，首次运行可能较慢"));
+    let started = std::time::Instant::now();
+    loop {
+        let check = {
+            let mut running = state.running.lock().unwrap();
+            running.get_mut(id).map(|child| child.try_wait())
+        };
+        let Some(check) = check else { return Err(BuildAttemptError::Fatal("插件启动已取消。".into())) };
+        match check {
+            Ok(Some(status)) if status.success() => {
+                state.running.lock().unwrap().remove(id);
+                return Ok(());
+            }
+            Ok(Some(status)) => {
+                state.running.lock().unwrap().remove(id);
+                let detail = format!("插件依赖准备失败（{status}）。\n\n最近日志：\n{}", log_tail(log_path));
+                return Err(BuildAttemptError::Retryable(detail));
+            }
+            Err(error) => {
+                state.running.lock().unwrap().remove(id);
+                set_runtime(state, id, PluginRuntime::new("failed", None, "读取依赖准备进程失败"));
+                return Err(BuildAttemptError::Fatal(format!("读取依赖准备进程失败：{error}")));
+            }
+            Ok(None) => {}
+        }
+        if started.elapsed() >= std::time::Duration::from_secs(30 * 60) {
+            let _ = stop_tracked(state, id);
+            let detail = format!("依赖准备超过 1800 秒，已停止启动。\n\n最近日志：\n{}", log_tail(log_path));
+            set_runtime(state, id, PluginRuntime::new("failed", None, "依赖准备超时，请查看详细日志"));
+            return Err(BuildAttemptError::Fatal(detail));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+fn run_build_command(state: &AppState, id: &str, plugin: &PluginView, log: &fs::File, log_path: &Path) -> Result<(), String> {
+    if plugin.manifest.entry.build.is_none() {
+        return Ok(());
+    }
+    use std::io::Write;
+
+    let candidates = proxy_candidates(state);
+    let attempted_proxy = candidates.len() > 1;
+    for proxy in candidates {
+        match run_build_command_once(state, id, plugin, log, log_path, proxy.as_deref()) {
+            Ok(()) => return Ok(()),
+            Err(BuildAttemptError::Fatal(error)) => return Err(error),
+            Err(BuildAttemptError::Retryable(error)) if proxy.is_some() => {
+                let mut retry_log = log.try_clone().map_err(|e| format!("写入构建日志失败：{e}"))?;
+                writeln!(retry_log, "[办公工具箱] 代理依赖准备未成功，正在改用直连重试。\n{error}")
+                    .map_err(|e| format!("写入构建日志失败：{e}"))?;
+            }
+            Err(BuildAttemptError::Retryable(error)) => {
+                set_runtime(state, id, PluginRuntime::new("failed", None, "插件依赖准备失败，请查看详细日志"));
+                return Err(if attempted_proxy {
+                    format!("{error}\n已分别尝试代理和直连，均未成功。")
+                } else {
+                    error
+                });
+            }
+        }
+    }
+    Err("插件依赖准备失败".into())
+}
+
+fn web_is_ready(url: &str) -> bool {
+    match ureq::get(url).timeout(std::time::Duration::from_secs(1)).call() {
+        Ok(_) | Err(ureq::Error::Status(_, _)) => true,
+        Err(_) => false,
+    }
+}
+
+fn open_web_url(url: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    let mut command = Command::new("rundll32");
+    #[cfg(windows)]
+    command.args(["url.dll,FileProtocolHandler", url]);
+    #[cfg(target_os = "macos")]
+    let mut command = Command::new("open");
+    #[cfg(target_os = "macos")]
+    command.arg(url);
+    #[cfg(not(any(windows, target_os = "macos")))]
+    return Err("当前系统不支持自动打开浏览器".into());
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        hide_console(&mut command);
+        command.spawn().map_err(|error| format!("打开浏览器失败：{error}"))?;
+        Ok(())
+    }
+}
+
 fn launch_by_id(app: &AppHandle, state: &AppState, id: &str, detached: Option<bool>) -> Result<PluginRuntime, String> {
     let plugin = find_plugin(app, state, id)?;
     if !plugin.rules.enabled {
@@ -856,6 +1051,14 @@ fn launch_by_id(app: &AppHandle, state: &AppState, id: &str, detached: Option<bo
     use std::io::Write;
     writeln!(log, "[办公工具箱] 启动命令：{program}；工作目录：{}", cwd.display()).map_err(|e| format!("写入插件日志失败：{e}"))?;
     writeln!(log, "[办公工具箱] 正在等待插件就绪，首次开发启动可能需要编译，请耐心等待。").map_err(|e| format!("写入插件日志失败：{e}"))?;
+    if dev_mode {
+        if let Err(error) = run_build_command(state, id, &plugin, &log, &log_path) {
+            if runtime_for(state, id).status != "stopped" {
+                set_runtime(state, id, PluginRuntime::new("failed", None, error.clone()));
+            }
+            return Err(error);
+        }
+    }
     let error_log = log.try_clone().map_err(|e| e.to_string())?;
     let mut command = Command::new(&program);
     command
@@ -873,6 +1076,11 @@ fn launch_by_id(app: &AppHandle, state: &AppState, id: &str, detached: Option<bo
         .env("OFFICE_PLUGIN_ALLOW_FILE_SYSTEM", plugin.rules.allow_file_system.to_string())
         .env("OFFICE_PLUGIN_ALLOW_GLOBAL_SHORTCUT", plugin.rules.allow_global_shortcut.to_string())
         .env("OFFICE_PLUGIN_ALLOW_AUTOSTART", plugin.rules.allow_plugin_autostart.to_string());
+    if dev_mode {
+        if let Some(dev) = &plugin.manifest.entry.dev {
+            command.envs(&dev.env);
+        }
+    }
     hide_console(&mut command);
     let child = match command.spawn() {
         Ok(child) => child,
@@ -927,14 +1135,24 @@ fn launch_by_id(app: &AppHandle, state: &AppState, id: &str, detached: Option<bo
             Ok(None) => {}
         }
 
-        if plugin_is_ready(&log_path, id) {
+        let web = plugin.manifest.entry.web.as_ref();
+        let web_ready = web.is_some_and(|web| web_is_ready(&web.url));
+        let ready = if web.is_some() { web_ready } else { plugin_is_ready(&log_path, id) };
+        if ready {
             if !state.running.lock().unwrap().contains_key(id) {
                 return Err("插件启动已取消。".into());
             }
-            return Ok(set_runtime(state, id, PluginRuntime::new("running", Some(pid), "插件已就绪")));
+            let mut detail = "插件已就绪".to_string();
+            if let Some(web) = web {
+                detail = match open_web_url(&web.url) {
+                    Ok(()) => format!("Web 服务已就绪：{}", web.url),
+                    Err(error) => format!("Web 服务已就绪，但{error}；请手动打开 {}", web.url),
+                };
+            }
+            return Ok(set_runtime(state, id, PluginRuntime::new("running", Some(pid), detail)));
         }
         // 未适配就绪信号的单文件插件保持兼容；开发命令必须等待明确信号。
-        if !dev_mode && started.elapsed() >= std::time::Duration::from_secs(2) {
+        if !dev_mode && web.is_none() && started.elapsed() >= std::time::Duration::from_secs(2) {
             return Ok(set_runtime(state, id, PluginRuntime::new("running", Some(pid), "进程运行中；插件未提供就绪信号")));
         }
         if started.elapsed() >= timeout {
@@ -1083,6 +1301,7 @@ fn get_settings(state: State<'_, AppState>) -> AppSettingsView {
         silent_start: settings.silent_start,
         theme: settings.theme,
         plugin_dir: plugin_directory_view(&state),
+        proxy: settings.proxy,
     }
 }
 
@@ -1105,6 +1324,24 @@ fn set_silent_start(state: State<'_, AppState>, enabled: bool) -> Result<AppSett
 fn set_theme(state: State<'_, AppState>, theme: AppTheme) -> Result<AppSettingsView, String> {
     state.settings.lock().unwrap().theme = theme;
     save_settings(&state)?;
+    Ok(get_settings(state))
+}
+
+fn save_proxy(state: &AppState, value: &str) -> Result<(), String> {
+    let proxy = normalize_proxy_url(value).unwrap_or_default();
+    if proxy.chars().any(char::is_whitespace) {
+        return Err("代理地址不能包含空白字符".into());
+    }
+    if !proxy.is_empty() {
+        ureq::Proxy::new(&proxy).map_err(|e| format!("代理地址无效：{e}"))?;
+    }
+    state.settings.lock().unwrap().proxy = proxy;
+    save_settings(state)
+}
+
+#[tauri::command]
+fn set_proxy(state: State<'_, AppState>, value: String) -> Result<AppSettingsView, String> {
+    save_proxy(&state, &value)?;
     Ok(get_settings(state))
 }
 
@@ -1182,7 +1419,7 @@ fn temporary_path(state: &AppState, prefix: &str) -> Result<PathBuf, String> {
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| e.to_string())?
         .as_nanos();
-    Ok(state.data_dir.join("tmp").join(format!("{prefix}-{}-{nonce}", std::process::id())))
+    Ok(plugins_dir(state).join(".office-toolbox-tmp").join(format!("{prefix}-{}-{nonce}", std::process::id())))
 }
 
 fn prepare_plugin_import<R: Runtime>(
@@ -1259,7 +1496,7 @@ fn finish_plugin_import<R: Runtime>(app: &AppHandle<R>, state: &AppState, sessio
     result
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn complete_plugin_import(app: AppHandle, state: State<'_, AppState>, session_id: String, manifest: PluginManifest) -> Result<PluginView, String> {
     finish_plugin_import(&app, &state, &session_id, manifest)
 }
@@ -1277,28 +1514,156 @@ fn cancel_plugin_import(state: State<'_, AppState>, session_id: String) {
     discard_pending_import(&state, &session_id);
 }
 
-fn clone_git_repository(url: &str, checkout: &Path) -> Result<(), String> {
-    if let Some(parent) = checkout.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("创建临时导入目录失败：{e}"))?;
+fn normalize_proxy_url(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(if value.contains("://") { value.into() } else { format!("http://{value}") })
+}
+
+fn parse_windows_proxy_server(value: &str) -> Option<String> {
+    if !value.contains('=') {
+        return normalize_proxy_url(value);
+    }
+    let mut http = None;
+    for item in value.split(';').filter_map(|item| item.split_once('=')) {
+        let protocol = item.0.trim().to_ascii_lowercase();
+        if protocol == "https" {
+            if let Some(proxy) = normalize_proxy_url(item.1) {
+                return Some(proxy);
+            }
+        } else if protocol == "http" {
+            http = normalize_proxy_url(item.1);
+        }
+    }
+    http
+}
+
+#[cfg(target_os = "macos")]
+fn parse_macos_proxy(value: &str) -> Option<String> {
+    let setting = |key: &str| value.lines().find_map(|line| {
+        let (name, value) = line.trim().split_once(':')?;
+        (name.trim() == key).then(|| value.trim().to_string())
+    });
+    for protocol in ["HTTPS", "HTTP"] {
+        if setting(&format!("{protocol}Enable")).as_deref() == Some("1") {
+            if let (Some(host), Some(port)) = (setting(&format!("{protocol}Proxy")), setting(&format!("{protocol}Port"))) {
+                return normalize_proxy_url(&format!("{host}:{port}"));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn system_proxy() -> Option<String> {
+    use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+
+    let settings = RegKey::predef(HKEY_CURRENT_USER).open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings").ok()?;
+    let enabled = settings.get_value::<u32, _>("ProxyEnable").unwrap_or(0);
+    if enabled == 0 {
+        return None;
+    }
+    settings.get_value::<String, _>("ProxyServer").ok().and_then(|value| parse_windows_proxy_server(&value))
+}
+
+#[cfg(target_os = "macos")]
+fn system_proxy() -> Option<String> {
+    let output = Command::new("scutil").arg("--proxy").output().ok()?;
+    output.status.success().then(|| parse_macos_proxy(&String::from_utf8_lossy(&output.stdout))).flatten()
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn system_proxy() -> Option<String> {
+    None
+}
+
+fn network_proxy() -> Option<String> {
+    for name in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] {
+        if let Some(proxy) = std::env::var(name).ok().and_then(|value| normalize_proxy_url(&value)) {
+            return Some(proxy);
+        }
+    }
+    system_proxy()
+}
+
+fn proxy_candidates_from(configured: &str, detected: Option<String>) -> Vec<Option<String>> {
+    let configured = configured.trim();
+    let first = if configured.is_empty() { detected } else { Some(configured.to_string()) };
+    first.into_iter().map(Some).chain(std::iter::once(None)).collect()
+}
+
+fn proxy_candidates(state: &AppState) -> Vec<Option<String>> {
+    let configured = state.settings.lock().unwrap().proxy.clone();
+    let detected = configured.trim().is_empty().then(network_proxy).flatten();
+    proxy_candidates_from(&configured, detected)
+}
+
+fn apply_command_proxy(command: &mut Command, proxy: Option<&str>) {
+    for name in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] {
+        if let Some(proxy) = proxy {
+            command.env(name, proxy);
+        } else {
+            command.env_remove(name);
+        }
+    }
+}
+
+fn clone_git_repository_once(url: &str, checkout: &Path, proxy: Option<&str>) -> Result<(), String> {
+    // 先由 Rust 创建并验证空目录，再使用相对目标，避免部分 Windows Git 环境展开中文或特殊磁盘的绝对路径。
+    fs::create_dir_all(checkout).map_err(|e| format!("创建 Git 临时工作目录失败（{}）：{e}", checkout.display()))?;
+    if fs::read_dir(checkout).map_err(|e| format!("读取 Git 临时工作目录失败（{}）：{e}", checkout.display()))?.next().is_some() {
+        return Err(format!("Git 临时工作目录不是空目录：{}", checkout.display()));
     }
     let mut command = Command::new("git");
     command
         .args(["clone", "--depth", "1", "--recurse-submodules", "--shallow-submodules", "--"])
         .arg(url)
-        .arg(checkout)
+        .arg(".")
+        .current_dir(checkout)
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    apply_command_proxy(&mut command, proxy);
     hide_console(&mut command);
-    let output = command.output().map_err(|e| format!("无法执行 Git，请先安装并配置 git：{e}"))?;
+    let output = match command.output() {
+        Ok(output) => output,
+        Err(error) => {
+            let _ = fs::remove_dir_all(checkout);
+            return Err(format!("无法执行 Git，请先安装并配置 git：{error}"));
+        }
+    };
     if !output.status.success() {
         let _ = fs::remove_dir_all(checkout);
-        let detail = String::from_utf8_lossy(&output.stderr);
+        let detail = String::from_utf8_lossy(&output.stderr).replace(url, &sanitize_repository_url(url));
         let tail = detail.chars().rev().take(4000).collect::<String>().chars().rev().collect::<String>();
         return Err(format!("Git 仓库克隆失败：{}", if tail.trim().is_empty() { output.status.to_string() } else { tail.trim().into() }));
     }
     Ok(())
+}
+
+fn clone_git_repository(state: &AppState, url: &str, checkout: &Path) -> Result<(), String> {
+    if let Some(parent) = checkout.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("创建临时导入目录失败：{e}"))?;
+    }
+    let candidates = proxy_candidates(state);
+    let attempted_proxy = candidates.len() > 1;
+    for proxy in candidates {
+        match clone_git_repository_once(url, checkout, proxy.as_deref()) {
+            Ok(()) => return Ok(()),
+            Err(error) if proxy.is_none() => {
+                return Err(if attempted_proxy {
+                    format!("{error}\n已分别尝试代理和直连，均未成功。")
+                } else {
+                    error
+                });
+            }
+            Err(_) => {}
+        }
+    }
+    Err("Git 仓库克隆失败".into())
 }
 
 fn sanitize_repository_url(url: &str) -> String {
@@ -1331,7 +1696,7 @@ fn import_git_plugin(app: AppHandle, state: State<'_, AppState>, url: String) ->
         return Err("请输入 Git 仓库地址".into());
     }
     let checkout = temporary_path(&state, "plugin-import")?;
-    clone_git_repository(url, &checkout)?;
+    clone_git_repository(&state, url, &checkout)?;
     let origin = PluginOrigin { kind: "git".into(), local_path: None, repository: Some(sanitize_repository_url(url)) };
     prepare_plugin_import(&app, &state, checkout.clone(), origin, Some(checkout))
 }
@@ -1377,6 +1742,22 @@ fn locate_archive_plugin_root(extracted: &Path) -> Result<PathBuf, String> {
     }
 }
 
+fn download_archive(download_url: &str, archive_path: &Path, proxy: Option<&str>) -> Result<(), String> {
+    let mut agent = ureq::AgentBuilder::new();
+    if let Some(proxy) = proxy {
+        let proxy = ureq::Proxy::new(proxy).map_err(|e| format!("代理配置无效：{e}"))?;
+        agent = agent.proxy(proxy);
+    }
+    let response = agent.build().get(download_url)
+        .timeout(std::time::Duration::from_secs(120))
+        .call()
+        .map_err(|e| format!("下载插件压缩包失败：{e}"))?;
+    let mut reader = response.into_reader();
+    let mut file = fs::File::create(archive_path).map_err(|e| format!("创建压缩包缓存失败：{e}"))?;
+    std::io::copy(&mut reader, &mut file).map_err(|e| format!("保存插件压缩包失败：{e}"))?;
+    Ok(())
+}
+
 /// 下载 ZIP 并解压，返回（临时目录，插件根目录）。调用方负责清理临时目录。
 fn fetch_archive_plugin(state: &AppState, url: &str) -> Result<(PathBuf, PathBuf), String> {
     let download_url = archive_download_url(url)?;
@@ -1384,14 +1765,21 @@ fn fetch_archive_plugin(state: &AppState, url: &str) -> Result<(PathBuf, PathBuf
     fs::create_dir_all(&temp).map_err(|e| format!("创建临时导入目录失败：{e}"))?;
     let result = (|| {
         let archive_path = temp.join("plugin.zip");
-        let response = ureq::get(&download_url)
-            .timeout(std::time::Duration::from_secs(120))
-            .call()
-            .map_err(|e| format!("下载插件压缩包失败：{e}"))?;
-        let mut reader = response.into_reader();
-        let mut file = fs::File::create(&archive_path).map_err(|e| format!("创建压缩包缓存失败：{e}"))?;
-        std::io::copy(&mut reader, &mut file).map_err(|e| format!("保存插件压缩包失败：{e}"))?;
-        drop(file);
+        let candidates = proxy_candidates(state);
+        let attempted_proxy = candidates.len() > 1;
+        for proxy in candidates {
+            match download_archive(&download_url, &archive_path, proxy.as_deref()) {
+                Ok(()) => break,
+                Err(_) if proxy.is_some() => {}
+                Err(error) => {
+                    return Err(if attempted_proxy {
+                        format!("{error}\n已分别尝试代理和直连，均未成功。")
+                    } else {
+                        error
+                    });
+                }
+            }
+        }
 
         let extracted = temp.join("extracted");
         fs::create_dir_all(&extracted).map_err(|e| format!("创建解压目录失败：{e}"))?;
@@ -1499,7 +1887,7 @@ fn update_plugin(app: AppHandle, state: State<'_, AppState>, id: String) -> Resu
         "git" => {
             let repository = origin.repository.as_deref().ok_or_else(|| "未记录 Git 仓库地址，无法更新；请移除后重新导入".to_string())?;
             let checkout = temporary_path(&state, "plugin-update-checkout")?;
-            clone_git_repository(repository, &checkout)?;
+            clone_git_repository(&state, repository, &checkout)?;
             let result = replace_plugin_from_source(&app, &state, &plugin, &checkout);
             let _ = fs::remove_dir_all(&checkout);
             result
@@ -1704,6 +2092,38 @@ fn open_plugin_directory(app: AppHandle, state: State<'_, AppState>, id: String)
     command.spawn().map(|_| ()).map_err(|e| format!("打开插件目录失败：{e}"))
 }
 
+fn read_readme(root: &Path) -> Result<String, String> {
+    let readme = fs::read_dir(root)
+        .map_err(|error| format!("读取插件目录失败：{error}"))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case("readme.md"))
+                && path.is_file()
+        })
+        .ok_or_else(|| "此插件没有 README.md。".to_string())?;
+    let metadata = fs::metadata(&readme).map_err(|error| format!("读取 README.md 信息失败：{error}"))?;
+    if metadata.len() > 2 * 1024 * 1024 {
+        return Err("README.md 超过 2 MB，请打开插件目录查看。".into());
+    }
+    fs::read_to_string(&readme).map_err(|error| format!("读取 README.md 失败：{error}"))
+}
+
+#[tauri::command]
+fn read_plugin_readme(app: AppHandle, state: State<'_, AppState>, id: String) -> Result<String, String> {
+    let plugin = find_plugin(&app, &state, &id)?;
+    read_readme(Path::new(&plugin.root))
+}
+
+#[tauri::command]
+fn open_plugin_page(app: AppHandle, state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let plugin = find_plugin(&app, &state, &id)?;
+    let web = plugin.manifest.entry.web.as_ref().ok_or_else(|| "此插件没有配置 Web 页面地址。".to_string())?;
+    open_web_url(&web.url)
+}
+
 #[tauri::command]
 fn read_plugin_log(state: State<'_, AppState>, id: String) -> String {
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_')) {
@@ -1767,6 +2187,7 @@ pub fn run() {
             set_launch_at_startup,
             set_silent_start,
             set_theme,
+            set_proxy,
             update_plugin,
             update_plugin_rules,
             launch_plugin,
@@ -1776,6 +2197,8 @@ pub fn run() {
             update_install_kind,
             open_release_page,
             open_plugin_directory,
+            read_plugin_readme,
+            open_plugin_page,
             read_plugin_log,
         ])
         .setup(move |app| {
@@ -1878,6 +2301,24 @@ mod tests {
     }
 
     #[test]
+    fn import_outcome_serializes_wizard_fields_in_camel_case() {
+        let outcome = PluginImportOutcome::NeedsManifest {
+            session_id: "session-1".into(),
+            source: "C:\\plugins\\LibreTV".into(),
+            draft: manifest(),
+            executable_candidates: vec!["bin/tool.exe".into()],
+            platform: "windows".into(),
+            architecture: "x86_64".into(),
+        };
+        let value = serde_json::to_value(outcome).unwrap();
+        assert_eq!(value.get("status").and_then(serde_json::Value::as_str), Some("needsManifest"));
+        assert_eq!(value.get("sessionId").and_then(serde_json::Value::as_str), Some("session-1"));
+        assert_eq!(value.get("executableCandidates").and_then(serde_json::Value::as_array).map(Vec::len), Some(1));
+        assert!(value.get("session_id").is_none());
+        assert!(value.get("executable_candidates").is_none());
+    }
+
+    #[test]
     fn manifest_draft_scans_entry_and_only_writes_to_import_copy() {
         let base = test_dir("manifest-draft");
         let source = base.join("My Tool");
@@ -1925,6 +2366,61 @@ mod tests {
         assert_eq!(draft.entry.dev.as_ref().unwrap().args, vec!["run"]);
         assert!(validate_manifest(&draft).is_ok());
         assert!(ensure_plugin_compatible(&base, &draft).is_ok());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn libretv_draft_installs_dependencies_and_detects_web_readiness() {
+        let base = test_dir("libretv-draft");
+        fs::write(base.join("package.json"), r#"{
+            "name": "libretv",
+            "scripts": {"dev": "next dev -p 8080", "build": "next build"}
+        }"#).unwrap();
+        let (draft, candidates) = manifest_draft(&base, "libretv".into());
+        assert!(candidates.is_empty());
+        let build = draft.entry.build.as_ref().unwrap();
+        assert_eq!(build.program, "npm");
+        assert_eq!(build.args, vec!["install", "--no-audit", "--no-fund"]);
+        #[cfg(windows)]
+        {
+            let (program, args) = resolve_command(&build.program, &build.args);
+            assert_eq!(program, "cmd.exe");
+            assert_eq!(args, vec!["/D", "/S", "/C", "npm", "install", "--no-audit", "--no-fund"]);
+        }
+        let dev = draft.entry.dev.as_ref().unwrap();
+        assert_eq!(dev.env.get("HOSTNAME").map(String::as_str), Some("127.0.0.1"));
+        assert_eq!(dev.env.get("PASSWORD").map(String::as_str), Some("libretv"));
+        assert_eq!(draft.entry.web.as_ref().unwrap().url, "http://127.0.0.1:8080");
+        assert!(validate_manifest(&draft).is_ok());
+        let serialized = serde_json::to_string(&draft).unwrap();
+        let restored: PluginManifest = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(restored.entry.web.unwrap().url, "http://127.0.0.1:8080");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn web_readiness_accepts_http_response_and_rejects_closed_port() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        });
+        assert!(web_is_ready(&format!("http://{address}")));
+        server.join().unwrap();
+        assert!(!web_is_ready(&format!("http://{address}")));
+    }
+
+    #[test]
+    fn readme_supports_common_casing_and_reports_missing_file() {
+        let base = test_dir("plugin-readme");
+        assert!(read_readme(&base).unwrap_err().contains("没有 README.md"));
+        fs::write(base.join("README.md"), "# 插件详情\n\n使用说明").unwrap();
+        assert_eq!(read_readme(&base).unwrap(), "# 插件详情\n\n使用说明");
         let _ = fs::remove_dir_all(base);
     }
 
@@ -2285,6 +2781,25 @@ mod tests {
     }
 
     #[test]
+    fn git_clone_accepts_precreated_unicode_work_tree() {
+        let base = test_dir("git-unicode-checkout");
+        let source = base.join("source.git");
+        let output = Command::new("git")
+            .args(["init", "--bare", "--"])
+            .arg(&source)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+
+        let checkout = base.join("办公工具箱").join(".office-toolbox-tmp").join("plugin-import-测试");
+        clone_git_repository_once(&source.to_string_lossy(), &checkout, None).unwrap();
+        assert!(checkout.join(".git").is_dir());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn git_repository_metadata_does_not_keep_http_userinfo() {
         assert_eq!(sanitize_repository_url("https://user:secret@example.com/owner/plugin.git"), "https://example.com/owner/plugin.git");
         assert_eq!(sanitize_repository_url("git@example.com:owner/plugin.git"), "git@example.com:owner/plugin.git");
@@ -2311,14 +2826,91 @@ mod tests {
             runtimes: Mutex::new(HashMap::new()),
             running: Mutex::new(HashMap::new()),
             detached: Mutex::new(HashMap::new()),
-        pending_imports: Mutex::new(HashMap::new()),
+            pending_imports: Mutex::new(HashMap::new()),
         };
 
         state.settings.lock().unwrap().theme = AppTheme::System;
         save_plugin_dir(&state, &custom).unwrap();
+        *state.plugin_dir.lock().unwrap() = custom.clone();
+        let temporary = temporary_path(&state, "plugin-import").unwrap();
+        assert!(temporary.starts_with(custom.join(".office-toolbox-tmp")));
+        assert!(!temporary.starts_with(base.join("tmp")));
         assert_eq!(load_plugin_dir(&base), custom);
         assert!(matches!(load_settings(&base).theme, AppTheme::System));
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn custom_proxy_is_validated_normalized_and_persisted() {
+        let base = test_dir("proxy-settings");
+        let state = AppState {
+            data_dir: base.clone(),
+            plugin_dir: Mutex::new(base.join("plugins")),
+            settings: Mutex::new(StoredSettings::default()),
+            rules: Mutex::new(HashMap::new()),
+            origins: Mutex::new(HashMap::new()),
+            runtimes: Mutex::new(HashMap::new()),
+            running: Mutex::new(HashMap::new()),
+            detached: Mutex::new(HashMap::new()),
+            pending_imports: Mutex::new(HashMap::new()),
+        };
+
+        save_proxy(&state, "  127.0.0.1:7890  ").unwrap();
+        assert_eq!(state.settings.lock().unwrap().proxy, "http://127.0.0.1:7890");
+        assert_eq!(load_settings(&base).proxy, "http://127.0.0.1:7890");
+        assert!(save_proxy(&state, "http://bad proxy").is_err());
+        assert_eq!(load_settings(&base).proxy, "http://127.0.0.1:7890");
+
+        save_proxy(&state, "").unwrap();
+        assert!(load_settings(&base).proxy.is_empty());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn proxy_candidates_prefer_custom_or_local_proxy_then_direct() {
+        let custom = Some("http://127.0.0.1:7890".to_string());
+        let local = Some("http://127.0.0.1:8080".to_string());
+        assert_eq!(
+            proxy_candidates_from("http://127.0.0.1:7890", local.clone()),
+            vec![custom.clone(), None]
+        );
+        assert_eq!(proxy_candidates_from("", local.clone()), vec![local, None]);
+        assert_eq!(proxy_candidates_from("", None), vec![None]);
+        assert_eq!(proxy_candidates_from("  ", custom.clone()), vec![custom, None]);
+    }
+
+    #[test]
+    fn direct_commands_remove_inherited_proxy_variables() {
+        let mut command = Command::new("test");
+        command.env("HTTPS_PROXY", "http://127.0.0.1:7890");
+        apply_command_proxy(&mut command, None);
+        assert!(command.get_envs().any(|(name, value)| name == "HTTPS_PROXY" && value.is_none()));
+
+        apply_command_proxy(&mut command, Some("http://127.0.0.1:8080"));
+        assert!(command.get_envs().any(|(name, value)| {
+            name == "HTTPS_PROXY" && value.is_some_and(|value| value == "http://127.0.0.1:8080")
+        }));
+    }
+
+    #[test]
+    fn parses_windows_proxy_and_prefers_https_endpoint() {
+        assert_eq!(parse_windows_proxy_server("127.0.0.1:7890").as_deref(), Some("http://127.0.0.1:7890"));
+        assert_eq!(
+            parse_windows_proxy_server("http=127.0.0.1:8080;https=127.0.0.1:7890").as_deref(),
+            Some("http://127.0.0.1:7890")
+        );
+        assert_eq!(
+            parse_windows_proxy_server("socks=127.0.0.1:1080;http=127.0.0.1:8080").as_deref(),
+            Some("http://127.0.0.1:8080")
+        );
+        assert_eq!(parse_windows_proxy_server(""), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parses_macos_system_proxy() {
+        let output = "HTTPEnable : 1\nHTTPProxy : 127.0.0.1\nHTTPPort : 8080\nHTTPSEnable : 1\nHTTPSProxy : 127.0.0.1\nHTTPSPort : 7890";
+        assert_eq!(parse_macos_proxy(output).as_deref(), Some("http://127.0.0.1:7890"));
     }
 
     #[test]
