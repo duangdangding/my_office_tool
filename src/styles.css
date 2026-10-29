@@ -336,8 +336,9 @@ code { font-family: "Cascadia Code", Consolas, monospace; }
 .runtime-detail { display: flex; align-items: center; gap: 8px; margin: -3px 0 13px; padding: 9px 10px; border-radius: 7px; font-size: 9px; line-height: 1.55; }
 .runtime-detail.starting { color: #957640; background: #faf6ed; border: 1px solid #f0e6d2; }
 .runtime-detail.starting .spinner { flex: 0 0 auto; color: #b18a48; }
-.runtime-detail.failed { justify-content: space-between; color: #a75550; background: #fcf1f0; border: 1px solid #f1dedd; }
-.runtime-detail.failed button { flex: 0 0 auto; padding: 2px 0; color: #a34844; background: transparent; border: 0; font-size: 9px; text-decoration: underline; }
+.runtime-detail.failed { align-items: flex-start; justify-content: space-between; color: #a75550; background: #fcf1f0; border: 1px solid #f1dedd; }
+.runtime-detail.failed > span { min-width: 0; display: -webkit-box; overflow: hidden; overflow-wrap: anywhere; white-space: pre-wrap; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.runtime-detail.failed button { flex: 0 0 auto; padding: 0; color: #a34844; background: transparent; border: 0; font-size: 9px; line-height: 1.55; text-decoration: underline; }
 .runtime-detail.web { color: #658374; background: #f2f7f4; border: 1px solid #e1ebe5; }
 .runtime-detail.web code { overflow-wrap: anywhere; }
 .capability-row { display: flex; flex-wrap: wrap; gap: 5px; padding-bottom: 15px; }

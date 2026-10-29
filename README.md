@@ -219,6 +219,6 @@ Windows 代码签名是另一套可选机制。配置 `WINDOWS_CERT_PFX`（PFX �
 
 - `npm run tauri build` 会先执行 `scripts/prepare-bundled-plugins.mjs`，把精简后的插件源码放入 `.generated/plugins/`；`.generated/plugin-binaries/` 中按相对路径暂存的预编译程序会自动合并进去。
 - macOS Release 构建会先分别编译 Apple Silicon／Intel 对应的速启和共享剪贴板，再把可执行文件放入主程序资源目录，因此安装后启动内置插件不需要 Bun／Rust。CI 会检查两个二进制确实进入发布资源。
-- Windows 当前仍随包插件源码；已有可执行文件时直接运行，否则回退到开发命令并需要 Bun／Rust 环境。
+- Windows 当前仍随包插件源码；已有可执行文件时直接运行，否则先执行 `bun install` 准备依赖，再回退到开发命令并需要 Bun／Rust 环境。
 - 插件依赖、编译缓存、日志、数据库不会进入安装包。
 - 插件的单实例、托盘和全局快捷键仍归插件自己管理，启动多个插件时注意快捷键冲突。

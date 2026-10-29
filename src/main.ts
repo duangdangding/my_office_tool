@@ -706,7 +706,11 @@ document.addEventListener("click", (event) => {
   }
   else if (action === "update") showUpdate(id);
   else if (action === "extract") showExtract(id);
-  else if (action === "log") void showLog(id);
+  else if (action === "log") {
+    const plugin = plugins.find((item) => item.manifest.id === id);
+    const errorMessage = plugin?.runtime.status === "failed" ? plugin.runtime.detail ?? undefined : undefined;
+    void showLog(id, errorMessage);
+  }
   else if (action === "open-page") void openPluginPage(id).catch((error) => toast(String(error), "error"));
   else if (action === "open-dir") {
     void openPluginDirectory(id).then(() => { if (!isDesktop) toast("预览模式：插件目录已复制到剪贴板。", "success"); }).catch((error) => toast(String(error), "error"));

@@ -1,6 +1,6 @@
 [package]
 name = "office-toolbox"
-version = "0.6.0"
+version = "0.6.1"
 description = "可扩展的本地办公工具箱"
 authors = ["Office Toolbox"]
 edition = "2021"

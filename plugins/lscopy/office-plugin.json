@@ -23,7 +23,7 @@
     },
     "build": {
       "program": "bun",
-      "args": ["run", "tauri", "build"],
+      "args": ["install"],
       "cwd": "."
     }
   },
