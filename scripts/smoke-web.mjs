@@ -15,7 +15,7 @@ try {
   ]);
   if (!page.ok || !script.ok || !suqi.ok || !lscopy.ok) throw new Error("网页或插件清单无法访问");
   const html = await page.text();
-  if (!html.includes("办公工具箱") || !html.includes("/src/main.ts")) throw new Error("主页面内容不完整");
+  if (!html.includes("插件坞") || !html.includes("/src/main.ts")) throw new Error("主页面内容不完整");
   const manifests = await Promise.all([suqi.json(), lscopy.json()]);
   if (manifests.map((item) => item.id).join(",") !== "suqi,lscopy") throw new Error("内置插件清单不完整");
   console.log("网页预览与两个内置插件清单访问正常。");

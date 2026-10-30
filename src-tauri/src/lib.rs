@@ -676,7 +676,7 @@ fn manifest_draft(root: &Path, id: String) -> (PluginManifest, Vec<String>) {
         permissions: Vec::new(),
         platforms: vec![current_platform().into()],
         entry: PluginEntry { mode: mode.into(), executable, dev, build, web },
-        standalone: StandaloneInfo { instructions: "由办公工具箱按照生成的 office-plugin.json 启动。".into() },
+        standalone: StandaloneInfo { instructions: "由插件坞按照生成的 office-plugin.json 启动。".into() },
     };
     (manifest, candidates)
 }
@@ -924,7 +924,7 @@ fn run_build_command_once(
     let (program, args) = resolve_command(&build.program, &build.args);
     let mut log = log.try_clone().map_err(|e| BuildAttemptError::Fatal(format!("写入构建日志失败：{e}")))?;
     let route = if proxy.is_some() { "代理" } else { "直连" };
-    writeln!(log, "[办公工具箱] 正在通过{route}准备依赖：{program} {}", args.join(" ")).map_err(|e| BuildAttemptError::Fatal(format!("写入构建日志失败：{e}")))?;
+    writeln!(log, "[插件坞] 正在通过{route}准备依赖：{program} {}", args.join(" ")).map_err(|e| BuildAttemptError::Fatal(format!("写入构建日志失败：{e}")))?;
     let error_log = log.try_clone().map_err(|e| BuildAttemptError::Fatal(format!("写入构建日志失败：{e}")))?;
     let mut command = Command::new(&program);
     command
@@ -988,7 +988,7 @@ fn run_build_command(state: &AppState, id: &str, plugin: &PluginView, log: &fs::
             Err(BuildAttemptError::Fatal(error)) => return Err(error),
             Err(BuildAttemptError::Retryable(error)) if proxy.is_some() => {
                 let mut retry_log = log.try_clone().map_err(|e| format!("写入构建日志失败：{e}"))?;
-                writeln!(retry_log, "[办公工具箱] 代理依赖准备未成功，正在改用直连重试。\n{error}")
+                writeln!(retry_log, "[插件坞] 代理依赖准备未成功，正在改用直连重试。\n{error}")
                     .map_err(|e| format!("写入构建日志失败：{e}"))?;
             }
             Err(BuildAttemptError::Retryable(error)) => {
@@ -1053,8 +1053,8 @@ fn launch_by_id(app: &AppHandle, state: &AppState, id: &str, detached: Option<bo
     let log_path = log_dir.join(format!("{id}.log"));
     let mut log = fs::OpenOptions::new().create(true).write(true).truncate(true).open(&log_path).map_err(|e| format!("打开插件日志失败：{e}"))?;
     use std::io::Write;
-    writeln!(log, "[办公工具箱] 启动命令：{program}；工作目录：{}", cwd.display()).map_err(|e| format!("写入插件日志失败：{e}"))?;
-    writeln!(log, "[办公工具箱] 正在等待插件就绪，首次开发启动可能需要编译，请耐心等待。").map_err(|e| format!("写入插件日志失败：{e}"))?;
+    writeln!(log, "[插件坞] 启动命令：{program}；工作目录：{}", cwd.display()).map_err(|e| format!("写入插件日志失败：{e}"))?;
+    writeln!(log, "[插件坞] 正在等待插件就绪，首次开发启动可能需要编译，请耐心等待。").map_err(|e| format!("写入插件日志失败：{e}"))?;
     if dev_mode {
         if let Err(error) = run_build_command(state, id, &plugin, &log, &log_path) {
             if runtime_for(state, id).status != "stopped" {
@@ -1905,7 +1905,7 @@ fn replace_plugin_from_source(app: &AppHandle, state: &AppState, plugin: &Plugin
 fn update_plugin(app: AppHandle, state: State<'_, AppState>, id: String) -> Result<PluginView, String> {
     let plugin = find_plugin(&app, &state, &id)?;
     if plugin.source != "imported" {
-        return Err("内置插件随工具箱发布，不能单独更新".into());
+        return Err("内置插件随插件坞发布，不能单独更新".into());
     }
     if plugin.runtime.status == "detached" {
         return Err("请先退出独立运行的插件，再执行更新".into());
@@ -2079,7 +2079,7 @@ fn update_install_kind() -> String {
         let exe_text = exe.to_string_lossy().to_lowercase();
         let exe_dir = exe.parent();
         for hive in [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE] {
-            for name in ["办公工具箱", "office-toolbox", "com.office.toolbox"] {
+            for name in ["插件坞", "办公工具箱", "office-toolbox", "com.office.toolbox"] {
                 let path = format!("Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{name}");
                 let Ok(key) = RegKey::predef(hive).open_subkey(path) else { continue };
                 let executable_matches = ["DisplayIcon", "UninstallString"].iter().any(|value_name| {
@@ -2251,14 +2251,14 @@ pub fn run() {
             read_plugin_log,
         ])
         .setup(move |app| {
-            let show = MenuItem::with_id(app, "show", "显示办公工具箱", true, None::<&str>)?;
+            let show = MenuItem::with_id(app, "show", "显示插件坞", true, None::<&str>)?;
             let hide = MenuItem::with_id(app, "hide", "隐藏窗口", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show, &hide, &quit])?;
             TrayIconBuilder::new()
                 .icon(app.default_window_icon().unwrap().clone())
                 .menu(&menu)
-                .tooltip("办公工具箱")
+                .tooltip("插件坞")
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "show" => show_main_window(app),
                     "hide" => {
@@ -2312,7 +2312,7 @@ pub fn run() {
             Ok(())
         })
         .build(tauri::generate_context!())
-        .expect("构建办公工具箱失败");
+        .expect("构建插件坞失败");
     app.run(|handle, event| {
         if matches!(event, tauri::RunEvent::ExitRequested { .. }) {
             stop_all(&handle.state::<AppState>());
@@ -2917,7 +2917,7 @@ mod tests {
             .unwrap();
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
 
-        let checkout = base.join("办公工具箱").join(".office-toolbox-tmp").join("plugin-import-测试");
+        let checkout = base.join("插件坞").join(".office-toolbox-tmp").join("plugin-import-测试");
         clone_git_repository_once(&source.to_string_lossy(), &checkout, None).unwrap();
         assert!(checkout.join(".git").is_dir());
         let _ = fs::remove_dir_all(base);

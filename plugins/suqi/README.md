@@ -1,10 +1,10 @@
 # 速启 (Suqi Launcher)
 
-## 办公工具箱插件
+## 插件坞插件
 
-本目录同时是一个独立的办公工具箱插件，根目录的 `office-plugin.json` 描述启动方式与能力声明。通过工具箱启动时会收到 `OFFICE_PLUGIN_RULES_FILE`、`OFFICE_PLUGIN_DATA_DIR` 和 `OFFICE_PLUGIN_ALLOW_*` 环境变量；这些变量是协作规则，不是操作系统沙箱。
+本目录同时是一个独立的插件坞插件，根目录的 `office-plugin.json` 描述启动方式与能力声明。通过插件坞启动时会收到 `OFFICE_PLUGIN_RULES_FILE`、`OFFICE_PLUGIN_DATA_DIR` 和 `OFFICE_PLUGIN_ALLOW_*` 环境变量；这些变量是协作规则，不是操作系统沙箱。
 
-脱离工具箱运行的方式不变：在本目录执行 `bun install`，然后执行 `bun run tauri dev`；需要发布时执行 `bun run tauri build`。已有数据、窗口和全局快捷键仍由速启自己管理。
+脱离插件坞运行的方式不变：在本目录执行 `bun install`，然后执行 `bun run tauri dev`；需要发布时执行 `bun run tauri build`。已有数据、窗口和全局快捷键仍由速启自己管理。
 
 跨平台桌面快捷启动器（Windows / macOS），基于 Tauri 2 + Vite + TypeScript + Rust。
 

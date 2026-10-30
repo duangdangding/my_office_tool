@@ -2,6 +2,6 @@
 name = "multi-arch-plugin"
 version = "0.1.0"
 edition = "2021"
-description = "办公工具箱多平台、多架构入口示例插件"
+description = "插件坞多平台、多架构入口示例插件"
 
 [dependencies]

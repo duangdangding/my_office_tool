@@ -1,8 +1,8 @@
 [package]
 name = "office-toolbox"
-version = "0.6.3"
-description = "可扩展的本地办公工具箱"
-authors = ["Office Toolbox"]
+version = "0.6.4"
+description = "本地插件的接入与运行管理中心"
+authors = ["PluginDock"]
 edition = "2021"
 
 [lib]

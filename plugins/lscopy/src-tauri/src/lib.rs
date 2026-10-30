@@ -1378,7 +1378,7 @@ fn start_watcher(app: AppHandle) {
                     }
                 }
             }
-            // 工具箱禁止剪贴板能力时仍保留窗口尺寸落盘线程，但不读取系统剪贴板。
+            // 插件坞禁止剪贴板能力时仍保留窗口尺寸落盘线程，但不读取系统剪贴板。
             if !office_plugin::allowed("ALLOW_CLIPBOARD") { continue; }
 
             let (enabled, excluded, max_items) = {

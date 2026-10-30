@@ -4,7 +4,7 @@
 
 ## 项目简介
 
-**办公工具箱（office-toolbox）**——Windows／macOS 本地办公工具宿主，基于 **Tauri 2 + Vanilla TypeScript + Rust**。
+**插件坞（PluginDock，内部标识 office-toolbox）**——Windows／macOS 本地插件接入与运行管理中心，基于 **Tauri 2 + Vanilla TypeScript + Rust**。
 
 - 通过 `office-plugin.json` 发现和导入独立进程插件。
 - 支持插件启停、运行规则、日志、托管启动和独立启动。
@@ -44,7 +44,7 @@ cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
 - 新增功能时同步更新 `README.md`；新增插件字段时同步更新清单说明和校验。
 - 能力规则通过环境变量和规则文件下发，需插件主动适配，**不是操作系统沙箱**。
 - 主程序规则存储在 `%LOCALAPPDATA%/OfficeToolbox/`；插件数据仍由插件自己管理。
-- 导入插件时复制到当前配置的插件目录（默认为工具箱数据目录），不修改用户原始插件目录。
+- 导入插件时复制到当前配置的插件目录（默认为插件坞数据目录），不修改用户原始插件目录。
 
 ## 提交前检查
 
