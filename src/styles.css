@@ -607,6 +607,7 @@ body { color: var(--text); background: var(--app-bg); }
 .card-footer, .rule-row, .form-toggle { border-color: var(--line); }
 .icon-button { color: var(--muted); }
 .icon-button:hover { color: var(--accent); background: var(--accent-soft); border-color: var(--line); }
+.icon-button.danger-icon:hover { color: var(--danger); background: var(--danger-soft); border-color: var(--line); }
 .mini-switch > span, .toggle-track { background: var(--line-strong); }
 .mini-switch input:checked + span, .form-toggle input:checked + .toggle-track { background: var(--accent); }
 .add-plugin-card, .loading-state, .empty-state { color: var(--muted); background: var(--surface-faint); border-color: var(--line-strong); }

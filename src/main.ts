@@ -204,6 +204,7 @@ function pluginCard(plugin: PluginView): string {
         ${manifest.entry.executable.length ? `<button class="icon-button" data-action="extract" data-id="${manifest.id}" title="提取编译产物">${icon("box", 17)}</button>` : ""}
         <button class="icon-button" data-action="rules" data-id="${manifest.id}" title="插件规则">${icon("sliders", 18)}</button>
         <button class="icon-button" data-action="standalone" data-id="${manifest.id}" title="独立启动（不托管）" ${!rules.enabled || busy || runtime.status !== "stopped" ? "disabled" : ""}>${icon("external", 17)}</button>
+        ${plugin.source === "imported" ? `<button class="icon-button danger-icon" data-action="remove" data-id="${manifest.id}" title="删除插件" aria-label="删除插件" ${busy ? "disabled" : ""}>${icon("trash", 17)}</button>` : ""}
         ${actionButton}
       </div>
     </div>
