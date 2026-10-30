@@ -461,6 +461,8 @@ code { font-family: "Cascadia Code", Consolas, monospace; }
 .warning-box { display: flex; gap: 10px; padding: 13px; color: #9b784a; background: #faf6ee; border: 1px solid #eee4d2; border-radius: 9px; }
 .warning-box p { margin: 0; color: #988363; font-size: 10px; line-height: 1.7; }
 .import-warning { margin-top: 18px; }
+.import-cleanup { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 10px; color: var(--muted); font-size: 9px; }
+.import-cleanup .text-button { flex: 0 0 auto; color: var(--danger); }
 #import-feedback:not(:empty), #manifest-feedback:not(:empty) { margin-top: 16px; }
 .import-progress { display: flex; align-items: center; gap: 11px; padding: 13px 14px; color: var(--accent-text); background: var(--accent-soft); border: 1px solid var(--line); border-radius: 9px; }
 .import-progress .spinner { flex: 0 0 auto; width: 15px; height: 15px; }
@@ -607,7 +609,8 @@ body { color: var(--text); background: var(--app-bg); }
 .card-footer, .rule-row, .form-toggle { border-color: var(--line); }
 .icon-button { color: var(--muted); }
 .icon-button:hover { color: var(--accent); background: var(--accent-soft); border-color: var(--line); }
-.icon-button.danger-icon:hover { color: var(--danger); background: var(--danger-soft); border-color: var(--line); }
+.button.card-remove { color: var(--danger); background: var(--danger-soft); border-color: var(--line); }
+.button.card-remove:hover { color: var(--danger); background: var(--danger-soft); border-color: var(--danger); }
 .mini-switch > span, .toggle-track { background: var(--line-strong); }
 .mini-switch input:checked + span, .form-toggle input:checked + .toggle-track { background: var(--accent); }
 .add-plugin-card, .loading-state, .empty-state { color: var(--muted); background: var(--surface-faint); border-color: var(--line-strong); }

@@ -10,6 +10,7 @@ export interface PluginRules {
   allowFileSystem: boolean;
   allowGlobalShortcut: boolean;
   allowPluginAutostart: boolean;
+  removed: boolean;
 }
 
 export type PluginExecutable = string | {

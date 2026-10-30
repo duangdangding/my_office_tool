@@ -3,6 +3,7 @@ import DOMPurify from "dompurify";
 import { marked } from "marked";
 import {
   cancelPluginImport,
+  cleanupFailedImports,
   chooseExtractDirectory,
   choosePluginDirectory,
   choosePluginStorageDirectory,
@@ -204,7 +205,7 @@ function pluginCard(plugin: PluginView): string {
         ${manifest.entry.executable.length ? `<button class="icon-button" data-action="extract" data-id="${manifest.id}" title="提取编译产物">${icon("box", 17)}</button>` : ""}
         <button class="icon-button" data-action="rules" data-id="${manifest.id}" title="插件规则">${icon("sliders", 18)}</button>
         <button class="icon-button" data-action="standalone" data-id="${manifest.id}" title="独立启动（不托管）" ${!rules.enabled || busy || runtime.status !== "stopped" ? "disabled" : ""}>${icon("external", 17)}</button>
-        ${plugin.source === "imported" ? `<button class="icon-button danger-icon" data-action="remove" data-id="${manifest.id}" title="删除插件" aria-label="删除插件" ${busy ? "disabled" : ""}>${icon("trash", 17)}</button>` : ""}
+        <button class="button card-remove" data-action="remove" data-id="${manifest.id}" ${busy ? "disabled" : ""}>${icon("trash", 15)}删除</button>
         ${actionButton}
       </div>
     </div>
@@ -388,7 +389,7 @@ function showModal(content: string, className = ""): void {
 function showImport(mode: "local" | "git" | "archive" = "local"): void {
   showModal(`<button class="modal-close" data-action="close-modal" aria-label="关闭">${icon("close")}</button><span class="modal-symbol">${icon("plus", 26)}</span><h2>导入插件</h2><div class="import-source-tabs"><button class="${mode === "local" ? "active" : ""}" data-action="import-mode" data-mode="local">${icon("folder", 16)}本地项目</button><button class="${mode === "archive" ? "active" : ""}" data-action="import-mode" data-mode="archive">${icon("box", 16)}压缩包（免 Git）</button><button class="${mode === "git" ? "active" : ""}" data-action="import-mode" data-mode="git">${icon("terminal", 16)}Git 项目</button></div>
     ${mode === "local" ? `<p class="modal-intro">选择插件文件夹。插件会复制到工具箱，原目录保持不变；没有 <code>office-plugin.json</code> 时，可以扫描并生成。</p><div class="modal-actions"><button class="button subtle" data-action="close-modal">取消</button><button class="button primary" data-action="confirm-import">选择插件文件夹${icon("arrow", 16)}</button></div>` : mode === "archive" ? `<form id="archive-import-form"><p class="modal-intro">输入 ZIP 下载地址或 GitHub 仓库地址，工具箱会直接下载并解压，<b>无需安装 Git</b>。没有清单时可在下载后补全。</p><label class="field-label" for="archive-repository">压缩包或仓库地址</label><input class="text-input" id="archive-repository" name="repository" type="text" placeholder="https://github.com/owner/plugin 或 https://…/plugin.zip" autocomplete="off" required autofocus/><div class="modal-actions"><button type="button" class="button subtle" data-action="close-modal">取消</button><button class="button primary" type="submit">下载并导入${icon("arrow", 16)}</button></div></form>` : `<form id="git-import-form"><p class="modal-intro">输入 Git 仓库地址，工具箱会克隆默认分支及其子模块，本机需已安装 Git。没有清单时可在克隆后补全。</p><label class="field-label" for="git-repository">仓库地址</label><input class="text-input" id="git-repository" name="repository" type="text" placeholder="https://github.com/owner/plugin.git" autocomplete="off" required autofocus/><div class="modal-actions"><button type="button" class="button subtle" data-action="close-modal">取消</button><button class="button primary" type="submit">克隆并导入${icon("arrow", 16)}</button></div></form>`}
-    <div id="import-feedback" aria-live="polite"></div><div class="warning-box import-warning">${icon("shield", 20)}<p>导入前会检查清单规范、当前平台和启动方式，不兼容的插件不会写入插件目录。插件是可执行代码，请只导入信任的来源。</p></div>`, "import-modal");
+    <div id="import-feedback" aria-live="polite"></div><div class="warning-box import-warning">${icon("shield", 20)}<p>导入前会检查清单规范、当前平台和启动方式，不兼容的插件不会写入插件目录。插件是可执行代码，请只导入信任的来源。</p></div><div class="import-cleanup"><span>远程导入失败留下了临时文件？</span><button type="button" class="text-button" data-action="cleanup-imports">${icon("trash", 14)}清理失败导入</button></div>`, "import-modal");
 }
 
 type ManifestImportRequest = Extract<PluginImportOutcome, { status: "needsManifest" }>;
@@ -571,7 +572,7 @@ function showRules(id: string): void {
     <div class="form-section"><h3>运行方式</h3>${ruleToggle("enabled", "启用插件", "停用后不能从工具箱启动，托管进程会停止。", rules.enabled)}${ruleToggle("autoStart", "随工具箱启动", "办公工具箱启动后自动拉起此插件。", rules.autoStart)}${ruleToggle("detach", "始终以独立模式启动", "启动后不由工具箱托管；插件退出本体后仍可继续运行。", rules.detach)}</div>
     <div class="form-section"><h3>插件能力 <span>需插件适配</span></h3>${ruleToggle("allowNetwork", "允许网络能力", "向插件声明允许使用网络与设备同步。", rules.allowNetwork)}${ruleToggle("allowClipboard", "允许剪贴板能力", "向插件声明允许读取或写入系统剪贴板。", rules.allowClipboard)}${ruleToggle("allowFileSystem", "允许文件系统能力", "向插件声明允许访问其功能所需文件。", rules.allowFileSystem)}${ruleToggle("allowGlobalShortcut", "允许全局快捷键", "向插件声明允许注册系统级快捷键。", rules.allowGlobalShortcut)}${ruleToggle("allowPluginAutostart", "允许插件设置开机启动", "默认禁止插件绕过工具箱自行设置系统自启。", rules.allowPluginAutostart)}</div>
     <div class="standalone-info"><b>${icon("external", 16)}独立运行</b><p>${escape(manifest.standalone.instructions)}</p><code>${escape(plugin.root)}</code></div>
-    <div class="modal-actions split"><div>${plugin.source === "imported" ? `<button type="button" class="button text-button" data-action="update" data-id="${manifest.id}">${icon("activity", 16)}更新插件</button><button type="button" class="button danger-text" data-action="remove" data-id="${manifest.id}">${icon("trash", 16)}移除插件</button>` : ""}${manifest.entry.executable.length ? `<button type="button" class="button text-button" data-action="extract" data-id="${manifest.id}">${icon("box", 16)}提取产物</button>` : ""}<button type="button" class="button text-button" data-action="log" data-id="${manifest.id}">${icon("terminal", 16)}运行日志</button></div><div><button type="button" class="button subtle" data-action="close-modal">取消</button><button class="button primary" type="submit">保存规则</button></div></div>
+    <div class="modal-actions split"><div>${plugin.source === "imported" ? `<button type="button" class="button text-button" data-action="update" data-id="${manifest.id}">${icon("activity", 16)}更新插件</button>` : ""}<button type="button" class="button danger-text" data-action="remove" data-id="${manifest.id}">${icon("trash", 16)}移除插件</button>${manifest.entry.executable.length ? `<button type="button" class="button text-button" data-action="extract" data-id="${manifest.id}">${icon("box", 16)}提取产物</button>` : ""}<button type="button" class="button text-button" data-action="log" data-id="${manifest.id}">${icon("terminal", 16)}运行日志</button></div><div><button type="button" class="button subtle" data-action="close-modal">取消</button><button class="button primary" type="submit">保存规则</button></div></div>
   </form>`, "rules-modal");
 }
 
@@ -678,6 +679,32 @@ document.addEventListener("click", (event) => {
     const mode = target.dataset.mode;
     showImport(mode === "git" || mode === "archive" ? mode : "local");
   }
+  else if (action === "cleanup-imports") {
+    showModal(`<button class="modal-close" data-action="close-modal">${icon("close")}</button><span class="modal-symbol danger">${icon("trash", 25)}</span><h2>清理失败导入？</h2><p class="modal-intro">只删除 Git 和 ZIP 导入失败后留下的临时文件，不影响已安装插件、原始项目或插件更新文件。</p><div class="modal-actions"><button class="button subtle" data-action="close-modal">取消</button><button class="button danger" data-action="confirm-cleanup-imports">确认清理</button></div>`);
+  }
+  else if (action === "confirm-cleanup-imports") {
+    const confirmButton = target as HTMLButtonElement;
+    if (confirmButton.disabled) return;
+    const controls = modalRoot.querySelectorAll<HTMLButtonElement>(".modal button");
+    controls.forEach((control) => { control.disabled = true; });
+    confirmButton.setAttribute("aria-busy", "true");
+    confirmButton.innerHTML = '<span class="spinner"></span>正在清理…';
+    void (async () => {
+      try {
+        await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+        const removed = await cleanupFailedImports();
+        closeModal();
+        toast(removed ? `已清理 ${removed} 个失败导入残留。` : "没有发现失败导入残留。", "success");
+      } catch (error) {
+        if (confirmButton.isConnected) {
+          controls.forEach((control) => { control.disabled = false; });
+          confirmButton.removeAttribute("aria-busy");
+          confirmButton.textContent = "确认清理";
+        }
+        toast(String(error), "error");
+      }
+    })();
+  }
   else if (action === "confirm-import") {
     void (async () => {
       const path = await choosePluginDirectory();
@@ -755,19 +782,38 @@ document.addEventListener("click", (event) => {
   else if (action === "remove") {
     const plugin = plugins.find((item) => item.manifest.id === id);
     const originalPath = plugin?.origin?.localPath;
-    showModal(`<button class="modal-close" data-action="close-modal">${icon("close")}</button><span class="modal-symbol danger">${icon("trash", 25)}</span><h2>移除「${escape(plugin?.manifest.name ?? id)}」？</h2><p class="modal-intro">工具箱中的插件副本会被删除。此操作无法撤销。</p>${originalPath ? `<label class="delete-source-option"><input id="delete-source" type="checkbox"/><span><b>同时删除原始本地项目</b><small>原目录中的所有文件都会被永久删除，请先确认不再需要。</small><code>${escape(originalPath)}</code></span></label>` : ""}<div class="modal-actions"><button class="button subtle" data-action="close-modal">取消</button><button class="button danger" data-action="confirm-remove" data-id="${id}">确认移除</button></div>`);
+    const description = plugin?.source === "builtin" ? "插件会从工具箱中移除，内置程序文件保留不变。此操作无法撤销。" : "工具箱中的插件副本会被删除。此操作无法撤销。";
+    showModal(`<button class="modal-close" data-action="close-modal">${icon("close")}</button><span class="modal-symbol danger">${icon("trash", 25)}</span><h2>移除「${escape(plugin?.manifest.name ?? id)}」？</h2><p class="modal-intro">${description}</p>${originalPath ? `<label class="delete-source-option"><input id="delete-source" type="checkbox"/><span><b>同时删除原始本地项目</b><small>原目录中的所有文件都会被永久删除，请先确认不再需要。</small><code>${escape(originalPath)}</code></span></label>` : ""}<div class="modal-actions"><button class="button subtle" data-action="close-modal">取消</button><button class="button danger" data-action="confirm-remove" data-id="${id}">确认移除</button></div>`);
   }
   else if (action === "confirm-remove") {
     const deleteSource = Boolean(modalRoot.querySelector<HTMLInputElement>("#delete-source")?.checked);
+    const isBuiltin = plugins.find((item) => item.manifest.id === id)?.source === "builtin";
+    const confirmButton = target as HTMLButtonElement;
+    if (confirmButton.disabled) return;
+    const controls = modalRoot.querySelectorAll<HTMLButtonElement | HTMLInputElement>(".modal button, .modal input");
+    controls.forEach((control) => { control.disabled = true; });
+    confirmButton.setAttribute("aria-busy", "true");
+    confirmButton.innerHTML = '<span class="spinner"></span>正在删除…';
+    busyId = id;
+    render();
     void (async () => {
       try {
+        await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
         await removePlugin(id, deleteSource);
         closeModal();
         await refresh();
-        toast(deleteSource ? "插件及原始本地项目已删除。" : "插件已移除，原始本地项目保持不变。", "success");
+        toast(deleteSource ? "插件及原始本地项目已删除。" : isBuiltin ? "内置插件已移除，程序文件保留未删除。" : "插件副本已删除，原始本地项目保持不变。", "success");
       } catch (error) {
         await refresh();
+        if (confirmButton.isConnected) {
+          controls.forEach((control) => { control.disabled = false; });
+          confirmButton.removeAttribute("aria-busy");
+          confirmButton.textContent = "确认移除";
+        }
         toast(String(error), "error");
+      } finally {
+        busyId = "";
+        render();
       }
     })();
   }
@@ -862,6 +908,7 @@ document.addEventListener("submit", (event) => {
     allowFileSystem: value("allowFileSystem"),
     allowGlobalShortcut: value("allowGlobalShortcut"),
     allowPluginAutostart: value("allowPluginAutostart"),
+    removed: plugin.rules.removed,
   };
   void saveRules(plugin.manifest.id, rules).then(async () => { closeModal(); await refresh(); toast("插件规则已保存。", "success"); }).catch((error) => toast(String(error), "error"));
 });

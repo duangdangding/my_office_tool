@@ -150,6 +150,8 @@ struct PluginRules {
     allow_global_shortcut: bool,
     #[serde(default)]
     allow_plugin_autostart: bool,
+    #[serde(default)]
+    removed: bool,
 }
 
 impl Default for PluginRules {
@@ -163,6 +165,7 @@ impl Default for PluginRules {
             allow_file_system: true,
             allow_global_shortcut: true,
             allow_plugin_autostart: false,
+            removed: false,
         }
     }
 }
@@ -793,8 +796,9 @@ fn discover_plugins<R: Runtime>(app: &AppHandle<R>, state: &AppState) -> Vec<Plu
             let path = entry.path();
             if !path.is_dir() || !path.join(MANIFEST_FILE).is_file() { continue }
             let Ok(manifest) = read_manifest(&path) else { continue };
-            if !ids.insert(manifest.id.clone()) { continue }
             let rules = state.rules.lock().unwrap().get(&manifest.id).cloned().unwrap_or_default();
+            if source == "builtin" && rules.removed { continue }
+            if !ids.insert(manifest.id.clone()) { continue }
             let origin = state.origins.lock().unwrap().get(&manifest.id).cloned();
             let runtime = runtime_for(state, &manifest.id);
             plugins.push(PluginView {
@@ -1514,6 +1518,33 @@ fn cancel_plugin_import(state: State<'_, AppState>, session_id: String) {
     discard_pending_import(&state, &session_id);
 }
 
+fn cleanup_failed_import_files(state: &AppState) -> Result<usize, String> {
+    let temporary_root = plugins_dir(state).join(".office-toolbox-tmp");
+    let entries = match fs::read_dir(temporary_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(format!("读取导入临时目录失败：{error}")),
+    };
+    let active = state.pending_imports.lock().unwrap().values().filter_map(|pending| pending.cleanup.clone()).collect::<HashSet<_>>();
+    let mut removed = 0;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("读取导入临时文件失败：{e}"))?;
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !path.is_dir() || active.contains(&path) || !(name.starts_with("plugin-import-") || name.starts_with("plugin-archive-")) {
+            continue;
+        }
+        fs::remove_dir_all(&path).map_err(|e| format!("清理失败导入 {} 失败：{e}", path.display()))?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
+#[tauri::command(async)]
+fn cleanup_failed_imports(state: State<'_, AppState>) -> Result<usize, String> {
+    cleanup_failed_import_files(&state)
+}
+
 fn normalize_proxy_url(value: &str) -> Option<String> {
     let value = value.trim();
     if value.is_empty() {
@@ -1944,22 +1975,38 @@ fn original_source_for_removal(plugin: &PluginView) -> Result<PathBuf, String> {
     Ok(source)
 }
 
-#[tauri::command]
+fn hide_builtin_plugin(state: &AppState, plugin: &PluginView) -> Result<(), String> {
+    let mut rules = plugin.rules.clone();
+    rules.enabled = false;
+    rules.auto_start = false;
+    rules.removed = true;
+    state.rules.lock().unwrap().insert(plugin.manifest.id.clone(), rules);
+    save_rules(state)
+}
+
+#[tauri::command(async)]
 fn remove_plugin(app: AppHandle, state: State<'_, AppState>, id: String, delete_source: Option<bool>) -> Result<(), String> {
     let plugin = find_plugin(&app, &state, &id)?;
-    if plugin.source != "imported" {
-        return Err("内置插件只能停用，不能移除".into());
+    let delete_source = delete_source.unwrap_or(false);
+    if plugin.source == "builtin" && delete_source {
+        return Err("内置插件不支持删除原始项目".into());
     }
-    let original = delete_source.unwrap_or(false).then(|| original_source_for_removal(&plugin)).transpose()?;
+    let original = (plugin.source == "imported" && delete_source).then(|| original_source_for_removal(&plugin)).transpose()?;
     stop_tracked(&state, &id)?;
     state.detached.lock().unwrap().remove(&id);
+    state.runtimes.lock().unwrap().remove(&id);
+    if plugin.source == "builtin" {
+        return hide_builtin_plugin(&state, &plugin);
+    }
     fs::remove_dir_all(&plugin.root).map_err(|e| format!("移除插件失败：{e}"))?;
+    if Path::new(&plugin.root).exists() {
+        return Err(format!("插件目录仍然存在，不能确认删除成功：{}", plugin.root));
+    }
     let source_result = original.map_or(Ok(()), |source| {
         fs::remove_dir_all(&source).map_err(|e| format!("插件已移除，但原始本地目录删除失败：{e}"))
     });
     state.rules.lock().unwrap().remove(&id);
     state.origins.lock().unwrap().remove(&id);
-    state.runtimes.lock().unwrap().remove(&id);
     let metadata_result = save_origins(&state).and_then(|_| save_rules(&state));
     source_result?;
     metadata_result
@@ -2184,6 +2231,7 @@ pub fn run() {
             import_archive_plugin,
             complete_plugin_import,
             cancel_plugin_import,
+            cleanup_failed_imports,
             get_settings,
             set_launch_at_startup,
             set_silent_start,
@@ -2474,6 +2522,45 @@ mod tests {
     }
 
     #[test]
+    fn failed_import_cleanup_preserves_active_imports_and_update_files() {
+        let base = test_dir("cleanup-imports");
+        let temporary = base.join("plugins").join(".office-toolbox-tmp");
+        let failed_git = temporary.join("plugin-import-failed");
+        let failed_archive = temporary.join("plugin-archive-failed");
+        let active = temporary.join("plugin-import-active");
+        let update = temporary.join("plugin-update-active");
+        for directory in [&failed_git, &failed_archive, &active, &update] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        let state = AppState {
+            data_dir: base.join("data"),
+            plugin_dir: Mutex::new(base.join("plugins")),
+            settings: Mutex::new(StoredSettings::default()),
+            rules: Mutex::new(HashMap::new()),
+            origins: Mutex::new(HashMap::new()),
+            runtimes: Mutex::new(HashMap::new()),
+            running: Mutex::new(HashMap::new()),
+            detached: Mutex::new(HashMap::new()),
+            pending_imports: Mutex::new(HashMap::new()),
+        };
+        state.pending_imports.lock().unwrap().insert(
+            "active".into(),
+            PendingPluginImport {
+                source: active.clone(),
+                origin: PluginOrigin { kind: "git".into(), local_path: None, repository: None },
+                cleanup: Some(active.clone()),
+            },
+        );
+
+        assert_eq!(cleanup_failed_import_files(&state).unwrap(), 2);
+        assert!(!failed_git.exists());
+        assert!(!failed_archive.exists());
+        assert!(active.exists());
+        assert!(update.exists());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn accepts_legacy_and_targeted_executable_entries() {
         let legacy: PluginExecutable = serde_json::from_str(r#""bin/legacy-tool""#).unwrap();
         let targeted: PluginExecutable = serde_json::from_str(
@@ -2522,6 +2609,42 @@ mod tests {
         assert!(!rules.detach);
         assert!(!rules.auto_start);
         assert!(!rules.allow_plugin_autostart);
+        assert!(!rules.removed);
+    }
+
+    #[test]
+    fn removing_builtin_keeps_program_files_and_persists_marker() {
+        let base = test_dir("remove-builtin");
+        let root = base.join("builtin");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("program.exe"), "program").unwrap();
+        let state = AppState {
+            data_dir: base.join("data"),
+            plugin_dir: Mutex::new(base.join("plugins")),
+            settings: Mutex::new(StoredSettings::default()),
+            rules: Mutex::new(HashMap::new()),
+            origins: Mutex::new(HashMap::new()),
+            runtimes: Mutex::new(HashMap::new()),
+            running: Mutex::new(HashMap::new()),
+            detached: Mutex::new(HashMap::new()),
+            pending_imports: Mutex::new(HashMap::new()),
+        };
+        let plugin = PluginView {
+            manifest: manifest(),
+            root: root.to_string_lossy().to_string(),
+            source: "builtin".into(),
+            origin: None,
+            rules: PluginRules { auto_start: true, ..PluginRules::default() },
+            runtime: PluginRuntime::stopped(),
+        };
+        hide_builtin_plugin(&state, &plugin).unwrap();
+        assert!(root.join("program.exe").is_file());
+        let saved = load_rules(&state.data_dir);
+        let rules = saved.get(&plugin.manifest.id).unwrap();
+        assert!(rules.removed);
+        assert!(!rules.enabled);
+        assert!(!rules.auto_start);
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]

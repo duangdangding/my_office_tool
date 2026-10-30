@@ -15,6 +15,7 @@ const defaultRules = (): PluginRules => ({
   allowFileSystem: true,
   allowGlobalShortcut: true,
   allowPluginAutostart: false,
+  removed: false,
 });
 
 const mockPlugins: PluginView[] = [suqiManifest, lscopyManifest].map((manifest, index) => ({
@@ -155,8 +156,12 @@ export async function stopPlugin(id: string): Promise<void> {
 
 export async function removePlugin(id: string, deleteSource = false): Promise<void> {
   if (isDesktop) return invoke("remove_plugin", { id, deleteSource });
-  const index = mockPlugins.findIndex((item) => item.manifest.id === id);
-  if (index >= 0 && mockPlugins[index].source === "imported") mockPlugins.splice(index, 1);
+  throw new Error("浏览器预览不会删除本地文件，请在桌面应用中操作。");
+}
+
+export async function cleanupFailedImports(): Promise<number> {
+  if (isDesktop) return invoke<number>("cleanup_failed_imports");
+  throw new Error("浏览器预览不会清理本地文件，请在桌面应用中操作。");
 }
 
 export async function extractPlugin(id: string, destination: string): Promise<ExtractPluginResult> {
